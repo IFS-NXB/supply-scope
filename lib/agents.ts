@@ -1,5 +1,6 @@
 import type { AgentRunInfo, Competitor, ProductIdea, ResearchResult } from "./types";
 import { extractProduct, firecrawlEnabled, search, type SearchResult } from "./firecrawl";
+import { analyzeWithClaude, llmEnabled } from "./llm";
 
 const STOPWORDS = new Set([
   "the", "a", "an", "and", "or", "for", "with", "without", "of", "to", "in",
@@ -194,16 +195,46 @@ function runDemo(idea: ProductIdea, started: number): ResearchResult {
 
 export async function runResearch(idea: ProductIdea): Promise<ResearchResult> {
   const started = Date.now();
-  if (!firecrawlEnabled()) return runDemo(idea, started);
-  try {
-    const result = await runLive(idea, started);
-    // If live research yielded nothing usable, fall back to demo data.
-    if (!result.benchmark.competitors.length) return runDemo(idea, started);
-    return result;
-  } catch (err) {
-    return {
-      ...runDemo(idea, started),
-      error: err instanceof Error ? err.message : "Research failed",
-    };
+
+  let result: ResearchResult;
+  if (!firecrawlEnabled()) {
+    result = runDemo(idea, started);
+  } else {
+    try {
+      result = await runLive(idea, started);
+      // If live research yielded nothing usable, fall back to demo data.
+      if (!result.benchmark.competitors.length) result = runDemo(idea, started);
+    } catch (err) {
+      result = {
+        ...runDemo(idea, started),
+        error: err instanceof Error ? err.message : "Research failed",
+      };
+    }
   }
+
+  // Strategy analyst layer — only runs when an Anthropic key is configured.
+  if (llmEnabled()) {
+    const analysis = await analyzeWithClaude(idea, result.benchmark.competitors, result.benchmark.priceRange);
+    if (analysis) {
+      result.analysis = analysis;
+      result.agents.push({
+        id: "analyst",
+        name: "Strategy Analyst",
+        description: "Turns the benchmark into positioning, pricing and next steps.",
+        status: "complete",
+        detail: `Produced positioning, ${analysis.differentiation.length} differentiators and ${analysis.nextSteps.length} next steps.`,
+      });
+    } else {
+      result.agents.push({
+        id: "analyst",
+        name: "Strategy Analyst",
+        description: "Turns the benchmark into positioning, pricing and next steps.",
+        status: "error",
+        detail: "Analysis could not be generated.",
+      });
+    }
+  }
+
+  result.durationMs = Date.now() - started;
+  return result;
 }

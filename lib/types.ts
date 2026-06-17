@@ -50,6 +50,14 @@ export type ResearchResult = {
     priceRange: { min: number; max: number; avg: number; currency: string } | null;
     insights: string[];
   };
+  analysis?: {
+    summary: string;
+    positioning: string;
+    differentiation: string[];
+    risks: string[];
+    suggestedPrice: string;
+    nextSteps: string[];
+  } | null;
   agents: AgentRunInfo[];
   sources: { title: string; url: string }[];
   error?: string;

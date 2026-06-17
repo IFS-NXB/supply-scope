@@ -19,6 +19,9 @@ validate and position faster.
      real product pages.
    - **Insights Agent** — synthesises pricing position, recurring ("table
      stakes") features, tags and an enriched summary.
+   - **Strategy Analyst** _(optional, Claude-powered)_ — turns the benchmark
+     into positioning, differentiation, a suggested price and next steps.
+     Runs only when `ANTHROPIC_API_KEY` is set.
 3. **Review the benchmark** — a competitor table (name, brand, price, features,
    source link), a market price range (low / average / high), positioning
    insights, and cited sources.
@@ -41,6 +44,7 @@ data** so the workflow is still fully demonstrable.
 - **Next.js 14** (App Router) + **TypeScript**
 - **Tailwind CSS**
 - **Firecrawl** for live web research
+- **Claude** (Anthropic SDK) for the optional Strategy Analyst agent
 - Lightweight **JSON file store** for persistence (`.data/db.json`)
 
 ## Getting started
@@ -58,9 +62,11 @@ npm run dev
 
 ### Environment variables
 
-| Variable             | Required | Description                                                        |
-| -------------------- | -------- | ------------------------------------------------------------------ |
-| `FIRECRAWL_API_KEY`  | No\*     | Enables live market research. Without it, agents return demo data. |
+| Variable             | Required | Description                                                          |
+| -------------------- | -------- | ------------------------------------------------------------------- |
+| `FIRECRAWL_API_KEY`  | No\*     | Enables live market research. Without it, agents return demo data.  |
+| `ANTHROPIC_API_KEY`  | No       | Enables the Claude-powered Strategy Analyst (positioning, pricing). |
+| `ANTHROPIC_MODEL`    | No       | Overrides the analysis model (sensible default if unset).          |
 
 \* Required for real benchmarking against the live web.
 
