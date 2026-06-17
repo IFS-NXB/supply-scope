@@ -5,11 +5,10 @@ import type {
   Maker,
   ProductIdea,
   ResearchResult,
-  ShoppingOffer,
   Supplier,
 } from "./types";
 import { extractProduct, firecrawlEnabled, search, type SearchResult } from "./firecrawl";
-import { googleShopping, apifyEnabled } from "./apify";
+import { amazonSearch, aliexpressSuppliers, apifyEnabled } from "./apify";
 import { analyzeWithClaude, classifyProduct, llmEnabled } from "./llm";
 import { parsePrice, priceRangeOf } from "./price";
 
@@ -52,61 +51,51 @@ function uniqueByDomain(results: SearchResult[], max: number): SearchResult[] {
   return out;
 }
 
-function firstBrand(title: string): string {
-  const words = title.trim().split(/\s+/);
-  let brand = words[0] || "";
-  if (words[1] && /^[A-Z0-9]/.test(words[1]) && brand.length <= 5) brand += " " + words[1];
-  return brand.replace(/[^A-Za-z0-9& ]/g, "").trim();
-}
-
-function buildMakers(competitors: Competitor[], offers: ShoppingOffer[]): Maker[] {
+function buildMakers(competitors: Competitor[]): Maker[] {
   const map = new Map<string, { name: string; low: number | null; currency: string; count: number }>();
-  const add = (name: string, priceValue: number | null, currency: string) => {
-    const clean = name.trim();
-    if (clean.length < 3) return;
-    const key = clean.toLowerCase();
-    const e = map.get(key) ?? { name: clean, low: null, currency: currency || "", count: 0 };
+  competitors.forEach((c) => {
+    if (!c.brand || c.brand.includes(".") || c.brand.length < 2) return;
+    const key = c.brand.toLowerCase();
+    const e = map.get(key) ?? { name: c.brand, low: null, currency: c.currency || "", count: 0 };
     e.count += 1;
-    if (priceValue != null && (e.low == null || priceValue < e.low)) {
-      e.low = priceValue;
-      e.currency = currency || e.currency;
+    if (c.priceValue != null && (e.low == null || c.priceValue < e.low)) {
+      e.low = c.priceValue;
+      e.currency = c.currency || e.currency;
     }
     map.set(key, e);
-  };
-
-  competitors.forEach((c) => {
-    if (c.brand && !c.brand.includes(".")) add(c.brand, c.priceValue, c.currency);
   });
-  offers.forEach((o) => add(firstBrand(o.title), o.priceValue, o.currency));
-
   return Array.from(map.values())
     .sort((a, b) => b.count - a.count)
-    .slice(0, 8)
+    .slice(0, 9)
     .map((m) => ({
       name: m.name,
       offers: m.count,
-      lowestPrice: m.low != null ? `${m.currency === "USD" ? "$" : (m.currency || "$") + " "}${Math.round(m.low)}` : "",
+      lowestPrice: m.low != null ? `${m.currency === "USD" || !m.currency ? "$" : m.currency + " "}${Math.round(m.low)}` : "",
     }));
 }
 
 function buildInsights(
   idea: ProductIdea,
   competitors: Competitor[],
-  offers: ShoppingOffer[],
+  suppliers: Supplier[],
   priceRange: ResearchResult["benchmark"]["priceRange"]
 ): string[] {
   const insights: string[] = [];
-  const total = competitors.length + offers.length;
-  if (total) insights.push(`Found ${total} comparable listing${total === 1 ? "" : "s"} across the web and marketplaces.`);
+  if (competitors.length) insights.push(`Benchmarked ${competitors.length} comparable products across online stores and the web.`);
   if (priceRange) {
     const fmt = (n: number) => `${priceRange.currency === "USD" ? "$" : (priceRange.currency || "$") + " "}${Math.round(n)}`;
-    insights.push(`Market pricing ranges from ${fmt(priceRange.min)} to ${fmt(priceRange.max)} (avg ~${fmt(priceRange.avg)}).`);
+    insights.push(`Retail pricing ranges from ${fmt(priceRange.min)} to ${fmt(priceRange.max)} (avg ~${fmt(priceRange.avg)}).`);
     const target = parsePrice(idea.priceTarget).value;
     if (target != null) {
       if (target < priceRange.min) insights.push(`Your ${fmt(target)} target undercuts every product found — a potential value play.`);
       else if (target > priceRange.max) insights.push(`Your ${fmt(target)} target sits above the market — lean into premium positioning.`);
       else insights.push(`Your ${fmt(target)} target lands mid-market — differentiation on features will matter.`);
     }
+  }
+  const ali = suppliers.filter((s) => s.source === "aliexpress" && s.price);
+  if (ali.length) {
+    const lows = ali.map((s) => parsePrice(s.price).value).filter((v): v is number => v != null);
+    if (lows.length) insights.push(`China suppliers list from ~$${Math.round(Math.min(...lows))}, suggesting healthy gross margin at retail prices.`);
   }
   if (insights.length < 2) insights.push("Use the benchmark below to position pricing, features and messaging before committing to development.");
   return insights;
@@ -119,13 +108,13 @@ function buildEnrichment(idea: ProductIdea, competitors: Competitor[], classific
     suggestedCategory: classification?.category || idea.category || "Uncategorised",
     tags,
     targetAudience: idea.audience || idea.targetMarket || "General consumers",
-    summary: `${baseSummary} Benchmarked against ${competitors.length} web product${competitors.length === 1 ? "" : "s"}.`,
+    summary: `${baseSummary} Benchmarked against ${competitors.length} product${competitors.length === 1 ? "" : "s"}.`,
   };
 }
 
 async function benchmarkViaFirecrawl(query: string): Promise<{ competitors: Competitor[]; sources: { title: string; url: string }[]; found: number }> {
   const results = await search(query, 8);
-  const candidates = uniqueByDomain(results, 6).slice(0, 5);
+  const candidates = uniqueByDomain(results, 4).slice(0, 3);
   const extractions = await Promise.allSettled(candidates.map((c) => extractProduct(c.url)));
 
   const competitors: Competitor[] = candidates.map((cand, i) => {
@@ -141,6 +130,8 @@ async function benchmarkViaFirecrawl(query: string): Promise<{ competitors: Comp
       features: (data?.keyFeatures ?? []).slice(0, 5).map((f) => String(f).trim()).filter(Boolean),
       url: cand.url,
       source: domainOf(cand.url),
+      rating: null,
+      reviews: null,
     };
   });
 
@@ -151,32 +142,39 @@ async function benchmarkViaFirecrawl(query: string): Promise<{ competitors: Comp
   };
 }
 
-async function findSuppliers(productClass: string): Promise<Supplier[]> {
-  const results = await search(`${productClass} manufacturer supplier wholesale OEM`, 8);
-  return uniqueByDomain(results, 6)
-    .slice(0, 6)
-    .map((r) => ({ name: r.title.replace(/\s*[-|–].*$/, "").trim(), url: r.url, snippet: r.description }));
+async function findWebSuppliers(productClass: string): Promise<Supplier[]> {
+  const results = await search(`${productClass} manufacturer supplier wholesale OEM`, 6);
+  return uniqueByDomain(results, 5)
+    .slice(0, 5)
+    .map((r) => ({ name: r.title.replace(/\s*[-|–].*$/, "").trim(), url: r.url, snippet: r.description, source: "web" }));
 }
 
-function offersToCompetitors(offers: ShoppingOffer[]): Competitor[] {
-  return offers.slice(0, 8).map((o) => ({
-    name: o.title,
-    brand: firstBrand(o.title) || o.store,
-    price: o.price,
-    priceValue: o.priceValue,
-    currency: o.currency,
-    features: [],
-    url: "",
-    source: o.store,
-  }));
+function dedupeCompetitors(rows: Competitor[]): Competitor[] {
+  const seen = new Set<string>();
+  return rows.filter((c) => {
+    const key = c.name.toLowerCase().slice(0, 40);
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function dedupeSuppliers(rows: Supplier[]): Supplier[] {
+  const seen = new Set<string>();
+  return rows.filter((s) => {
+    const key = (s.url || s.name).toLowerCase();
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 function runDemo(idea: ProductIdea, started: number): ResearchResult {
   const base = 25 + (idea.title.length % 7) * 6;
   const competitors: Competitor[] = [
-    { name: `${idea.category || "Market"} Leader Pro`, brand: "Northwind", price: `$${base + 20}`, priceValue: base + 20, currency: "USD", features: ["Premium materials", "2-year warranty", "Eco-friendly"], url: "https://example.com/a", source: "example.com" },
-    { name: `Everyday ${idea.category || "Product"}`, brand: "Brightway", price: `$${base}`, priceValue: base, currency: "USD", features: ["Affordable", "Lightweight", "Eco-friendly"], url: "https://example.com/b", source: "example.com" },
-    { name: `${idea.title} Alternative`, brand: "Marisol", price: `$${base + 10}`, priceValue: base + 10, currency: "USD", features: ["Compact", "Premium materials"], url: "https://example.com/c", source: "example.com" },
+    { name: `${idea.category || "Market"} Leader Pro`, brand: "Northwind", price: `$${base + 20}`, priceValue: base + 20, currency: "USD", features: ["Premium materials", "2-year warranty"], url: "https://example.com/a", source: "example.com", rating: 4.6, reviews: 1200 },
+    { name: `Everyday ${idea.category || "Product"}`, brand: "Brightway", price: `$${base}`, priceValue: base, currency: "USD", features: ["Affordable", "Lightweight"], url: "https://example.com/b", source: "example.com", rating: 4.2, reviews: 430 },
+    { name: `${idea.title} Alternative`, brand: "Marisol", price: `$${base + 10}`, priceValue: base + 10, currency: "USD", features: ["Compact"], url: "https://example.com/c", source: "example.com", rating: 4.4, reviews: 90 },
   ];
   const priceRange = priceRangeOf(competitors);
   return {
@@ -185,10 +183,11 @@ function runDemo(idea: ProductIdea, started: number): ResearchResult {
     durationMs: Date.now() - started,
     enrichment: buildEnrichment(idea, competitors, null),
     benchmark: { competitors, priceRange, insights: buildInsights(idea, competitors, [], priceRange) },
-    makers: buildMakers(competitors, []),
+    makers: buildMakers(competitors),
+    suppliers: [],
     agents: [
-      { id: "discovery", name: "Market Discovery Agent", description: "Searches the live web for similar products.", status: "skipped", detail: "Demo mode — set FIRECRAWL_API_KEY for live web research." },
-      { id: "benchmark", name: "Benchmarking Agent", description: "Extracts competitor pricing and features.", status: "complete", detail: "Generated sample benchmark data." },
+      { id: "amazon", name: "Online Stores", description: "Scans Amazon for live listings.", status: "skipped", detail: "Demo mode — set APIFY_API_TOKEN for live store data." },
+      { id: "benchmark", name: "Benchmarking", description: "Builds the competitor benchmark.", status: "complete", detail: "Generated sample benchmark data." },
     ],
     sources: [],
   };
@@ -197,14 +196,13 @@ function runDemo(idea: ProductIdea, started: number): ResearchResult {
 export async function runResearch(idea: ProductIdea): Promise<ResearchResult> {
   const started = Date.now();
 
-  // Zero-key safety net — keep the workflow demonstrable.
   if (!firecrawlEnabled() && !apifyEnabled() && !llmEnabled()) {
     return runDemo(idea, started);
   }
 
   const agents: AgentRunInfo[] = [];
 
-  // 1. Classify (Claude, vision-aware) — drives the search terms downstream.
+  // 1. Classify (Claude, vision-aware) — drives search terms.
   let classification: Classification | null = null;
   if (llmEnabled()) {
     classification = await classifyProduct(idea);
@@ -213,75 +211,71 @@ export async function runResearch(idea: ProductIdea): Promise<ResearchResult> {
       name: "Classifier",
       description: "Classifies the product and derives search terms.",
       status: classification ? "complete" : "error",
-      detail: classification
-        ? `Class: ${classification.productClass} · ${classification.keywords.length} keywords.`
-        : "Could not classify.",
+      detail: classification ? `Class: ${classification.productClass} · ${classification.keywords.length} keywords.` : "Could not classify.",
     });
   }
   const productClass = classification?.productClass || idea.category || idea.title;
-  const searchQuery =
+  const webQuery =
     (classification?.keywords?.length ? classification.keywords.join(" ") : `${idea.title} ${idea.category}`.trim()) +
     " similar products";
 
-  // 2/3 + 4 + 5 run in parallel: Firecrawl benchmark, Apify marketplace, Firecrawl suppliers.
-  const [benchRes, offers, suppliers] = await Promise.all([
-    firecrawlEnabled() ? benchmarkViaFirecrawl(searchQuery) : Promise.resolve(null),
-    apifyEnabled() ? googleShopping(productClass, 12) : Promise.resolve<ShoppingOffer[]>([]),
-    firecrawlEnabled() ? findSuppliers(productClass) : Promise.resolve<Supplier[]>([]),
+  // 2. Run sources in parallel: Amazon (stores), Firecrawl (web), AliExpress (China suppliers), Firecrawl (web suppliers).
+  const [amazon, benchRes, aliexpress, webSuppliers] = await Promise.all([
+    apifyEnabled() ? amazonSearch(productClass, 8) : Promise.resolve<Competitor[]>([]),
+    firecrawlEnabled() ? benchmarkViaFirecrawl(webQuery) : Promise.resolve(null),
+    apifyEnabled() ? aliexpressSuppliers(productClass, 8) : Promise.resolve<Supplier[]>([]),
+    firecrawlEnabled() ? findWebSuppliers(productClass) : Promise.resolve<Supplier[]>([]),
   ]);
 
-  const competitors = benchRes?.competitors ?? [];
+  if (apifyEnabled()) {
+    agents.push({
+      id: "amazon",
+      name: "Online Stores (Amazon)",
+      description: "Pulls live Amazon listings: brands, prices, ratings.",
+      status: amazon.length ? "complete" : "error",
+      detail: amazon.length ? `Found ${amazon.length} Amazon listings.` : "No Amazon listings found.",
+    });
+  }
+  if (firecrawlEnabled()) {
+    const fc = benchRes?.competitors ?? [];
+    agents.push({
+      id: "web",
+      name: "Web Research (Firecrawl)",
+      description: "Finds and extracts similar products across the web.",
+      status: benchRes && benchRes.found ? "complete" : "error",
+      detail: benchRes ? `Found ${benchRes.found} web sources · benchmarked ${fc.length}.` : "No web results.",
+    });
+  }
+  if (apifyEnabled()) {
+    agents.push({
+      id: "aliexpress",
+      name: "China Suppliers (AliExpress)",
+      description: "Finds China suppliers, wholesale prices and demand.",
+      status: aliexpress.length ? "complete" : "error",
+      detail: aliexpress.length ? `Found ${aliexpress.length} AliExpress suppliers.` : "No AliExpress results.",
+    });
+  }
+  if (firecrawlEnabled()) {
+    agents.push({
+      id: "web-suppliers",
+      name: "Web Sourcing (Firecrawl)",
+      description: "Finds manufacturers and suppliers on the web.",
+      status: webSuppliers.length ? "complete" : "error",
+      detail: webSuppliers.length ? `Found ${webSuppliers.length} supplier leads.` : "No suppliers found.",
+    });
+  }
+
+  // Combine sources.
+  const competitors = dedupeCompetitors([...amazon, ...(benchRes?.competitors ?? [])]).slice(0, 12);
+  const suppliers = dedupeSuppliers([...aliexpress, ...webSuppliers]).slice(0, 10);
   const sources = benchRes?.sources ?? [];
 
-  if (firecrawlEnabled()) {
-    agents.push({
-      id: "discovery",
-      name: "Market Discovery Agent",
-      description: "Searches the live web for similar products.",
-      status: benchRes && benchRes.found ? "complete" : "error",
-      detail: benchRes ? `Found ${benchRes.found} candidate sources.` : "No web results returned.",
-    });
-    const withData = competitors.filter((c) => c.price || c.features.length).length;
-    agents.push({
-      id: "benchmark",
-      name: "Benchmarking Agent",
-      description: "Extracts competitor pricing and features.",
-      status: competitors.length ? "complete" : "error",
-      detail: `Benchmarked ${competitors.length} products (${withData} with pricing/features).`,
-    });
-  }
-
-  let marketplace: ResearchResult["marketplace"] = null;
-  if (apifyEnabled()) {
-    marketplace = offers.length ? { offers, priceRange: priceRangeOf(offers) } : null;
-    const stores = new Set(offers.map((o) => o.store).filter(Boolean)).size;
-    agents.push({
-      id: "marketplace",
-      name: "Marketplace Scan",
-      description: "Finds live store listings and prices.",
-      status: offers.length ? "complete" : "error",
-      detail: offers.length ? `Found ${offers.length} store offers across ${stores} retailers.` : "No store offers found.",
-    });
-  }
-
-  if (firecrawlEnabled()) {
-    agents.push({
-      id: "suppliers",
-      name: "Sourcing Agent",
-      description: "Finds manufacturers and suppliers.",
-      status: suppliers.length ? "complete" : "error",
-      detail: suppliers.length ? `Found ${suppliers.length} supplier leads.` : "No suppliers found.",
-    });
-  }
-
-  // Derived views.
-  const priceRange = priceRangeOf([...competitors, ...offers]);
-  const makers = buildMakers(competitors, offers);
-  const insights = buildInsights(idea, competitors, offers, priceRange);
+  const priceRange = priceRangeOf(competitors);
+  const makers = buildMakers(competitors);
+  const insights = buildInsights(idea, competitors, suppliers, priceRange);
   const enrichment = buildEnrichment(idea, competitors, classification);
 
-  // If live research produced nothing usable at all, fall back to demo data.
-  if (!competitors.length && !offers.length && !classification && !suppliers.length) {
+  if (!competitors.length && !suppliers.length && !classification) {
     return runDemo(idea, started);
   }
 
@@ -292,16 +286,15 @@ export async function runResearch(idea: ProductIdea): Promise<ResearchResult> {
     enrichment,
     classification,
     benchmark: { competitors, priceRange, insights },
-    marketplace,
     suppliers,
     makers,
     agents,
     sources,
   };
 
-  // 6. Strategy analyst (Claude) — informed by web + marketplace data.
+  // Strategy analyst (Claude) — reasons over the combined benchmark.
   if (llmEnabled()) {
-    const analysis = await analyzeWithClaude(idea, [...competitors, ...offersToCompetitors(offers)], priceRange);
+    const analysis = await analyzeWithClaude(idea, competitors, priceRange);
     if (analysis) {
       result.analysis = analysis;
       agents.push({

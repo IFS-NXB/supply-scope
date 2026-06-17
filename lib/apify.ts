@@ -1,13 +1,22 @@
-import type { ShoppingOffer } from "./types";
-import { parsePrice } from "./price";
+import type { Competitor, Supplier } from "./types";
 
 const BASE = "https://api.apify.com/v2";
 
-// Google Shopping actor — keyword search returning live store listings.
-const GOOGLE_SHOPPING_ACTOR = "burbn~google-shopping-scraper";
+// Marketplace-native actors (richer than generic web extraction).
+const AMAZON_ACTOR = "junglee~Amazon-crawler";
+const ALIEXPRESS_ACTOR = "thirdwatch~aliexpress-product-scraper";
 
 export function apifyEnabled(): boolean {
   return Boolean(process.env.APIFY_API_TOKEN);
+}
+
+function normalizeCurrency(c: string): string {
+  const up = (c || "").toUpperCase();
+  if (up === "$" || up === "US$") return "USD";
+  if (up === "£") return "GBP";
+  if (up === "€") return "EUR";
+  if (up === "A$") return "AUD";
+  return up;
 }
 
 async function runActor(actorId: string, input: unknown, timeoutMs: number): Promise<any[] | null> {
@@ -37,27 +46,64 @@ async function runActor(actorId: string, input: unknown, timeoutMs: number): Pro
   }
 }
 
-export async function googleShopping(query: string, limit = 12): Promise<ShoppingOffer[]> {
+// Amazon — the dominant online store: brands, prices, sellers, ratings, reviews.
+export async function amazonSearch(query: string, limit = 8): Promise<Competitor[]> {
+  const url = `https://www.amazon.com/s?k=${encodeURIComponent(query)}`;
   const items = await runActor(
-    GOOGLE_SHOPPING_ACTOR,
-    { searchQuery: query, limit: Math.max(10, limit), country: "us", language: "en" },
-    150_000
+    AMAZON_ACTOR,
+    { categoryOrProductUrls: [{ url }], maxItemsPerStartUrl: limit, maxSearchPagesPerStartUrl: 1 },
+    180_000
   );
   if (!items) return [];
 
   return items
-    .filter((i) => i?.product_title)
+    .filter((i) => i?.title && i?.price?.value)
+    .slice(0, limit)
     .map((i) => {
-      const p = parsePrice(i.price);
+      const cur = normalizeCurrency(i.price?.currency || "$");
       return {
-        title: String(i.product_title).trim(),
-        price: i.price ? String(i.price).trim() : "",
-        priceValue: p.value,
-        currency: p.currency,
-        store: i.store_name ? String(i.store_name).trim() : "",
-        rating: typeof i.product_rating === "number" ? i.product_rating : null,
-        reviews: typeof i.product_num_reviews === "number" ? i.product_num_reviews : null,
-        image: Array.isArray(i.product_photos) ? String(i.product_photos[0] ?? "") : "",
-      } satisfies ShoppingOffer;
+        name: String(i.title).trim(),
+        brand: i.brand ? String(i.brand).trim() : "",
+        price: `${cur === "USD" ? "$" : cur + " "}${i.price.value}`,
+        priceValue: typeof i.price.value === "number" ? i.price.value : null,
+        currency: cur,
+        features: [],
+        url: i.url ? String(i.url) : "",
+        source: "amazon.com",
+        rating: typeof i.stars === "number" ? i.stars : null,
+        reviews: typeof i.reviewsCount === "number" ? i.reviewsCount : null,
+      } satisfies Competitor;
+    });
+}
+
+// AliExpress — China sellers/suppliers: wholesale-ish prices, order volume, ratings.
+export async function aliexpressSuppliers(query: string, limit = 8): Promise<Supplier[]> {
+  const items = await runActor(
+    ALIEXPRESS_ACTOR,
+    {
+      queries: [query],
+      maxResults: limit,
+      country: "US",
+      proxyConfiguration: { useApifyProxy: true },
+    },
+    180_000
+  );
+  if (!items) return [];
+
+  return items
+    .filter((i) => i?.title && i?.url)
+    .slice(0, limit)
+    .map((i) => {
+      const cur = normalizeCurrency(i.sale_price_currency || "USD");
+      const price = i.sale_price != null ? `${cur === "USD" ? "$" : cur + " "}${i.sale_price}` : "";
+      return {
+        name: String(i.title).trim(),
+        url: String(i.url),
+        snippet: Array.isArray(i.selling_points) ? i.selling_points.join(" · ") : "",
+        price,
+        orders: typeof i.orders_count === "number" ? i.orders_count : null,
+        rating: typeof i.rating === "number" ? i.rating : null,
+        source: "aliexpress",
+      } satisfies Supplier;
     });
 }

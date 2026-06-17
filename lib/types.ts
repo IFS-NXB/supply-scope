@@ -25,6 +25,8 @@ export type Competitor = {
   features: string[];
   url: string;
   source: string;
+  rating?: number | null;
+  reviews?: number | null;
 };
 
 export type AgentRunInfo = {
@@ -43,21 +45,14 @@ export type Classification = {
   summary: string;
 };
 
-export type ShoppingOffer = {
-  title: string;
-  price: string;
-  priceValue: number | null;
-  currency: string;
-  store: string;
-  rating: number | null;
-  reviews: number | null;
-  image: string;
-};
-
 export type Supplier = {
   name: string;
   url: string;
   snippet: string;
+  price?: string;
+  orders?: number | null;
+  rating?: number | null;
+  source?: string;
 };
 
 export type Maker = {
@@ -82,10 +77,6 @@ export type ResearchResult = {
     insights: string[];
   };
   classification?: Classification | null;
-  marketplace?: {
-    offers: ShoppingOffer[];
-    priceRange: { min: number; max: number; avg: number; currency: string } | null;
-  } | null;
   suppliers?: Supplier[];
   makers?: Maker[];
   analysis?: {

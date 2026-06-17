@@ -16,13 +16,13 @@ validate and position faster.
 2. **Agents go to work automatically** — a pipeline of agents runs:
    - **Classifier** _(Claude, vision-aware)_ — classifies the product (using the
      uploaded image if present) into a category/class and derives search terms.
-   - **Market Discovery Agent** _(Firecrawl)_ — searches the live web for
-     similar products.
-   - **Benchmarking Agent** _(Firecrawl)_ — extracts competitor **pricing and
-     features** from real product pages.
-   - **Marketplace Scan** _(Apify · Google Shopping)_ — pulls live store
-     listings with **prices, retailers and ratings**.
-   - **Sourcing Agent** _(Firecrawl)_ — finds **manufacturers and suppliers**.
+   - **Online Stores** _(Apify · Amazon)_ — live listings with **brands,
+     prices, ratings and review counts**.
+   - **Web Research** _(Firecrawl)_ — finds and extracts similar products
+     across the open web (DTC brands and long-tail).
+   - **China Suppliers** _(Apify · AliExpress)_ — suppliers with **wholesale
+     prices, order volume and ratings** (the margin & sourcing signal).
+   - **Web Sourcing** _(Firecrawl)_ — additional manufacturer/supplier leads.
    - **Strategy Analyst** _(Claude)_ — turns it all into positioning,
      differentiation, a suggested price and next steps.
 3. **Review the results** — competitor benchmark, store prices, "who's making
@@ -33,11 +33,11 @@ validate and position faster.
 The agents combine three providers, each behind its own key and each degrading
 gracefully when its key is absent:
 
-- **[Firecrawl](https://firecrawl.dev)** — `/search` discovers comparable
-  products and suppliers; `/scrape` with a structured `json` schema extracts each
-  competitor's name, brand, price and features.
-- **[Apify](https://apify.com)** — runs a Google Shopping actor to return live
-  store offers (price, retailer, rating, reviews).
+- **[Apify](https://apify.com)** — marketplace-native actors: an **Amazon**
+  scraper (brands, prices, ratings, reviews) and an **AliExpress** scraper
+  (wholesale prices, order volume) for China suppliers.
+- **[Firecrawl](https://firecrawl.dev)** — `/search` + `/scrape` for broad web
+  discovery, DTC brand pages and long-tail supplier leads.
 - **[Claude](https://www.anthropic.com)** — classifies the product (with vision
   on the uploaded image) and writes the strategy analysis via structured output.
 
@@ -48,8 +48,8 @@ workflow is still fully demonstrable.
 
 - **Next.js 14** (App Router) + **TypeScript**
 - **Tailwind CSS**
-- **Firecrawl** for live web research & supplier discovery
-- **Apify** (Google Shopping) for live store prices
+- **Apify** (Amazon + AliExpress) for store prices & China suppliers
+- **Firecrawl** for broad web research & supplier leads
 - **Claude** (Anthropic SDK) for classification & strategy analysis
 - Lightweight **JSON file store** for persistence (`.data/db.json`)
 
@@ -73,7 +73,7 @@ npm run dev
 | `FIRECRAWL_API_KEY`  | No\*     | Enables web research, benchmarking & supplier discovery.           |
 | `ANTHROPIC_API_KEY`  | No       | Enables the Claude Classifier (vision) and Strategy Analyst.        |
 | `ANTHROPIC_MODEL`    | No       | Overrides the analysis model (sensible default if unset).          |
-| `APIFY_API_TOKEN`    | No       | Enables the Marketplace Scan (live store prices via Google Shopping).|
+| `APIFY_API_TOKEN`    | No       | Enables Online Stores (Amazon) + China Suppliers (AliExpress).      |
 
 \* Required for real benchmarking against the live web.
 
