@@ -35,6 +35,37 @@ export type AgentRunInfo = {
   detail: string;
 };
 
+export type Classification = {
+  category: string;
+  productClass: string;
+  keywords: string[];
+  attributes: string[];
+  summary: string;
+};
+
+export type ShoppingOffer = {
+  title: string;
+  price: string;
+  priceValue: number | null;
+  currency: string;
+  store: string;
+  rating: number | null;
+  reviews: number | null;
+  image: string;
+};
+
+export type Supplier = {
+  name: string;
+  url: string;
+  snippet: string;
+};
+
+export type Maker = {
+  name: string;
+  offers: number;
+  lowestPrice: string;
+};
+
 export type ResearchResult = {
   mode: "live" | "demo";
   ranAt: string;
@@ -50,6 +81,13 @@ export type ResearchResult = {
     priceRange: { min: number; max: number; avg: number; currency: string } | null;
     insights: string[];
   };
+  classification?: Classification | null;
+  marketplace?: {
+    offers: ShoppingOffer[];
+    priceRange: { min: number; max: number; avg: number; currency: string } | null;
+  } | null;
+  suppliers?: Supplier[];
+  makers?: Maker[];
   analysis?: {
     summary: string;
     positioning: string;

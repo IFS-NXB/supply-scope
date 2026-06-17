@@ -13,38 +13,44 @@ validate and position faster.
 1. **Submit a product idea** — title, description, category, target market,
    audience, target price, key features, and an optional reference image
    (upload or URL).
-2. **Agents go to work automatically** — three agents run as a pipeline:
-   - **Market Discovery Agent** — searches the live web for similar products.
-   - **Benchmarking Agent** — extracts competitor **pricing and features** from
-     real product pages.
-   - **Insights Agent** — synthesises pricing position, recurring ("table
-     stakes") features, tags and an enriched summary.
-   - **Strategy Analyst** _(optional, Claude-powered)_ — turns the benchmark
-     into positioning, differentiation, a suggested price and next steps.
-     Runs only when `ANTHROPIC_API_KEY` is set.
-3. **Review the benchmark** — a competitor table (name, brand, price, features,
-   source link), a market price range (low / average / high), positioning
-   insights, and cited sources.
+2. **Agents go to work automatically** — a pipeline of agents runs:
+   - **Classifier** _(Claude, vision-aware)_ — classifies the product (using the
+     uploaded image if present) into a category/class and derives search terms.
+   - **Market Discovery Agent** _(Firecrawl)_ — searches the live web for
+     similar products.
+   - **Benchmarking Agent** _(Firecrawl)_ — extracts competitor **pricing and
+     features** from real product pages.
+   - **Marketplace Scan** _(Apify · Google Shopping)_ — pulls live store
+     listings with **prices, retailers and ratings**.
+   - **Sourcing Agent** _(Firecrawl)_ — finds **manufacturers and suppliers**.
+   - **Strategy Analyst** _(Claude)_ — turns it all into positioning,
+     differentiation, a suggested price and next steps.
+3. **Review the results** — competitor benchmark, store prices, "who's making
+   it", supplier leads, positioning insights, AI strategy analysis, and sources.
 
 ## How the agents work
 
-The agents are powered by [Firecrawl](https://firecrawl.dev):
+The agents combine three providers, each behind its own key and each degrading
+gracefully when its key is absent:
 
-- `POST /v2/search` discovers comparable products on the open web.
-- `POST /v2/scrape` with a structured `json` schema extracts each competitor's
-  product name, brand, price and key features.
-- Prices are parsed into numbers to compute the market range, and features are
-  tallied to surface common (table-stakes) attributes.
+- **[Firecrawl](https://firecrawl.dev)** — `/search` discovers comparable
+  products and suppliers; `/scrape` with a structured `json` schema extracts each
+  competitor's name, brand, price and features.
+- **[Apify](https://apify.com)** — runs a Google Shopping actor to return live
+  store offers (price, retailer, rating, reviews).
+- **[Claude](https://www.anthropic.com)** — classifies the product (with vision
+  on the uploaded image) and writes the strategy analysis via structured output.
 
-If `FIRECRAWL_API_KEY` is **not** set, the agents return deterministic **demo
-data** so the workflow is still fully demonstrable.
+If **no** keys are set, the agents return deterministic **demo data** so the
+workflow is still fully demonstrable.
 
 ## Tech stack
 
 - **Next.js 14** (App Router) + **TypeScript**
 - **Tailwind CSS**
-- **Firecrawl** for live web research
-- **Claude** (Anthropic SDK) for the optional Strategy Analyst agent
+- **Firecrawl** for live web research & supplier discovery
+- **Apify** (Google Shopping) for live store prices
+- **Claude** (Anthropic SDK) for classification & strategy analysis
 - Lightweight **JSON file store** for persistence (`.data/db.json`)
 
 ## Getting started
@@ -64,9 +70,10 @@ npm run dev
 
 | Variable             | Required | Description                                                          |
 | -------------------- | -------- | ------------------------------------------------------------------- |
-| `FIRECRAWL_API_KEY`  | No\*     | Enables live market research. Without it, agents return demo data.  |
-| `ANTHROPIC_API_KEY`  | No       | Enables the Claude-powered Strategy Analyst (positioning, pricing). |
+| `FIRECRAWL_API_KEY`  | No\*     | Enables web research, benchmarking & supplier discovery.           |
+| `ANTHROPIC_API_KEY`  | No       | Enables the Claude Classifier (vision) and Strategy Analyst.        |
 | `ANTHROPIC_MODEL`    | No       | Overrides the analysis model (sensible default if unset).          |
+| `APIFY_API_TOKEN`    | No       | Enables the Marketplace Scan (live store prices via Google Shopping).|
 
 \* Required for real benchmarking against the live web.
 

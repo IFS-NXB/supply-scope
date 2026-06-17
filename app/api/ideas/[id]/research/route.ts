@@ -3,7 +3,7 @@ import { getIdea, updateIdea } from "@/lib/store";
 import { runResearch } from "@/lib/agents";
 
 export const dynamic = "force-dynamic";
-export const maxDuration = 120;
+export const maxDuration = 300;
 
 export async function POST(_req: Request, { params }: { params: { id: string } }) {
   const idea = await getIdea(params.id);

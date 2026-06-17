@@ -20,14 +20,20 @@ import {
   DollarSign,
   ListChecks,
   ShieldAlert,
+  Store,
+  Factory,
+  Star,
+  Building2,
 } from "lucide-react";
 import type { ProductIdea, ResearchResult } from "@/lib/types";
 import { BenchmarkTable } from "@/components/benchmark-table";
 
 const PIPELINE = [
-  { id: "search", name: "Market Discovery Agent", description: "Searching the web for similar products…", icon: Search },
-  { id: "benchmark", name: "Benchmarking Agent", description: "Extracting competitor pricing & features…", icon: BarChart3 },
-  { id: "insights", name: "Insights Agent", description: "Synthesising positioning & insights…", icon: Lightbulb },
+  { id: "classify", name: "Classifier", description: "Classifying the product & deriving search terms…", icon: Tag },
+  { id: "discovery", name: "Market Discovery", description: "Searching the web for similar products…", icon: Search },
+  { id: "marketplace", name: "Marketplace Scan", description: "Pulling live store listings & prices…", icon: Store },
+  { id: "suppliers", name: "Sourcing", description: "Finding manufacturers & suppliers…", icon: Factory },
+  { id: "analyst", name: "Strategy Analyst", description: "Synthesising positioning, pricing & next steps…", icon: Lightbulb },
 ];
 
 export function ResearchPanel({ idea, autoRun }: { idea: ProductIdea; autoRun: boolean }) {
@@ -248,6 +254,9 @@ function Results({ result }: { result: ResearchResult }) {
         <div className="mt-4 grid gap-4 sm:grid-cols-2">
           <InfoRow icon={Tag} label="Suggested category" value={result.enrichment.suggestedCategory} />
           <InfoRow icon={Users} label="Target audience" value={result.enrichment.targetAudience} />
+          {result.classification?.productClass && (
+            <InfoRow icon={Compass} label="Product class" value={result.classification.productClass} />
+          )}
         </div>
         {result.enrichment.tags.length > 0 && (
           <div className="mt-4 flex flex-wrap gap-2">
@@ -276,6 +285,104 @@ function Results({ result }: { result: ResearchResult }) {
           <BenchmarkTable benchmark={result.benchmark} />
         </div>
       </div>
+
+      {/* Marketplace store prices (Apify Google Shopping) */}
+      {result.marketplace?.offers?.length ? (
+        <div>
+          <div className="flex flex-wrap items-end justify-between gap-3">
+            <h2 className="flex items-center gap-2 text-lg font-bold text-slate-900">
+              <Store className="h-5 w-5 text-brand-600" /> Prices from stores
+            </h2>
+            {result.marketplace.priceRange && (
+              <div className="flex gap-4 text-sm">
+                <Stat label="Low" value={money(result.marketplace.priceRange.min, result.marketplace.priceRange.currency)} />
+                <Stat label="Average" value={money(result.marketplace.priceRange.avg, result.marketplace.priceRange.currency)} accent />
+                <Stat label="High" value={money(result.marketplace.priceRange.max, result.marketplace.priceRange.currency)} />
+              </div>
+            )}
+          </div>
+          <div className="mt-4 overflow-hidden rounded-2xl border border-slate-200">
+            <div className="scrollbar-thin overflow-x-auto">
+              <table className="w-full min-w-[640px] text-left text-sm">
+                <thead className="bg-slate-50 text-xs uppercase tracking-wide text-slate-500">
+                  <tr>
+                    <th className="px-4 py-3 font-semibold">Store</th>
+                    <th className="px-4 py-3 font-semibold">Product</th>
+                    <th className="px-4 py-3 font-semibold">Price</th>
+                    <th className="px-4 py-3 font-semibold">Rating</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {result.marketplace.offers.map((o, i) => (
+                    <tr key={i} className="align-top hover:bg-slate-50/60">
+                      <td className="px-4 py-3 font-semibold text-slate-900">{o.store || "—"}</td>
+                      <td className="px-4 py-3 text-slate-600"><span className="line-clamp-1">{o.title}</span></td>
+                      <td className="px-4 py-3 font-semibold text-slate-900">{o.price || "—"}</td>
+                      <td className="px-4 py-3 text-slate-600">
+                        {o.rating != null ? (
+                          <span className="inline-flex items-center gap-1">
+                            <Star className="h-3.5 w-3.5 fill-amber-400 text-amber-400" />
+                            {o.rating}
+                            {o.reviews != null && <span className="text-xs text-slate-400">({o.reviews})</span>}
+                          </span>
+                        ) : (
+                          "—"
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {/* Makers — who's making it */}
+      {result.makers?.length ? (
+        <div>
+          <h2 className="flex items-center gap-2 text-lg font-bold text-slate-900">
+            <Building2 className="h-5 w-5 text-brand-600" /> Who&apos;s making it
+          </h2>
+          <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+            {result.makers.map((m) => (
+              <div key={m.name} className="flex items-center justify-between rounded-xl border border-slate-200 bg-white p-4">
+                <div className="min-w-0">
+                  <p className="truncate text-sm font-semibold text-slate-900">{m.name}</p>
+                  <p className="text-xs text-slate-500">{m.offers} listing{m.offers === 1 ? "" : "s"}</p>
+                </div>
+                {m.lowestPrice && <span className="ml-3 shrink-0 text-sm font-bold text-slate-900">from {m.lowestPrice}</span>}
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : null}
+
+      {/* Suppliers — sourcing */}
+      {result.suppliers?.length ? (
+        <div>
+          <h2 className="flex items-center gap-2 text-lg font-bold text-slate-900">
+            <Factory className="h-5 w-5 text-brand-600" /> Suppliers &amp; manufacturers
+          </h2>
+          <div className="mt-4 grid gap-3 sm:grid-cols-2">
+            {result.suppliers.map((s, i) => (
+              <a
+                key={i}
+                href={s.url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="block rounded-xl border border-slate-200 bg-white p-4 transition hover:border-brand-300 hover:shadow-soft"
+              >
+                <p className="flex items-center gap-1.5 text-sm font-semibold text-slate-900">
+                  <span className="line-clamp-1">{s.name}</span>
+                  <ExternalLink className="h-3.5 w-3.5 shrink-0 text-slate-400" />
+                </p>
+                {s.snippet && <p className="mt-2 line-clamp-2 text-xs leading-relaxed text-slate-500">{s.snippet}</p>}
+              </a>
+            ))}
+          </div>
+        </div>
+      ) : null}
 
       {/* Insights */}
       {result.benchmark.insights.length > 0 && (
@@ -340,6 +447,11 @@ function Stat({ label, value, accent }: { label: string; value: string; accent?:
       <p className={`text-base font-bold ${accent ? "text-brand-700" : "text-slate-900"}`}>{value}</p>
     </div>
   );
+}
+
+function money(n: number, currency: string): string {
+  const prefix = !currency || currency === "USD" ? "$" : currency + " ";
+  return `${prefix}${Math.round(n)}`;
 }
 
 function AnalysisBlock({
