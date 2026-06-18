@@ -74,8 +74,21 @@ npm run dev
 | `ANTHROPIC_API_KEY`  | No       | Enables the Claude Classifier (vision) and Strategy Analyst.        |
 | `ANTHROPIC_MODEL`    | No       | Overrides the analysis model (sensible default if unset).          |
 | `APIFY_API_TOKEN`    | No       | Enables Online Stores (Amazon) + China Suppliers (AliExpress).      |
+| `SUPABASE_URL`       | No       | Shared Retail-supply-intel DB API URL (enables Postgres persistence).|
+| `SUPABASE_SERVICE_ROLE_KEY` | No | Server-side service-role key; enables the shared-DB integration.   |
+| `BASIC_AUTH_USER`    | No       | Access-gate username for the public deployment (default `supplyscope`).|
+| `BASIC_AUTH_PASSWORD`| No†      | Access-gate password; gates every page + API route when set.        |
 
 \* Required for real benchmarking against the live web.
+† Required **on Vercel** — without it the deployment fails closed (503). See [`DEPLOY.md`](./DEPLOY.md).
+
+## Deploy
+
+The app deploys to **Vercel** from GitHub (production on `main`, preview per PR)
+and is protected by an HTTP Basic Auth gate (`middleware.ts`) so the public URL
+can run live against the shared DB without exposing it to anonymous traffic.
+Full setup, environment-variable matrix and security notes are in
+[`DEPLOY.md`](./DEPLOY.md).
 
 ## Project structure
 
@@ -96,10 +109,11 @@ components/                    UI (submit form, research panel, benchmark table,
 
 ## Notes & next steps
 
-- **Persistence:** the JSON file store is great for local/dev and a single
-  long-running server. For production / serverless (e.g. Vercel), swap
-  `lib/store.ts` for a database — Supabase/Postgres slots in cleanly behind the
-  same interface.
+- **Persistence:** when `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` are set,
+  ideas persist to Postgres and research fans out into the shared
+  Retail-supply-intel tables (`lib/store.ts`, `lib/integration.ts`). Without
+  them it falls back to the local JSON file store (`.data/db.json`), which is
+  fine for local/dev but not durable on serverless — set Supabase for Vercel.
 - **Background runs:** research currently runs synchronously per request
   (~20–40s). For larger fan-out, move it to a queue/job and poll for status.
 - **Auth & teams, attachments, more agents** (sourcing, demand/trend research)
