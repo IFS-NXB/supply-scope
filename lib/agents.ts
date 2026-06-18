@@ -1,6 +1,16 @@
-import type { AgentRunInfo, Competitor, ProductIdea, ResearchResult } from "./types";
+import type {
+  AgentRunInfo,
+  Classification,
+  Competitor,
+  Maker,
+  ProductIdea,
+  ResearchResult,
+  Supplier,
+} from "./types";
 import { extractProduct, firecrawlEnabled, search, type SearchResult } from "./firecrawl";
-import { analyzeWithClaude, llmEnabled } from "./llm";
+import { amazonSearch, aliexpressSuppliers, apifyEnabled } from "./apify";
+import { analyzeWithClaude, classifyProduct, llmEnabled } from "./llm";
+import { parsePrice, priceRangeOf } from "./price";
 
 const STOPWORDS = new Set([
   "the", "a", "an", "and", "or", "for", "with", "without", "of", "to", "in",
@@ -16,17 +26,6 @@ function domainOf(url: string): string {
   }
 }
 
-function parsePrice(input?: string): { value: number | null; currency: string } {
-  if (!input) return { value: null, currency: "" };
-  const text = input.replace(/,/g, "");
-  const currencyMatch = text.match(/(A\$|US\$|\$|£|€|¥|USD|AUD|GBP|EUR|NZD|CAD)/i);
-  const numberMatch = text.match(/(\d+(?:\.\d{1,2})?)/);
-  return {
-    value: numberMatch ? parseFloat(numberMatch[1]) : null,
-    currency: currencyMatch ? currencyMatch[1].toUpperCase().replace("US$", "USD").replace("A$", "AUD").replace("$", "USD") : "",
-  };
-}
-
 function keywords(...parts: string[]): string[] {
   const seen = new Set<string>();
   const out: string[] = [];
@@ -37,11 +36,6 @@ function keywords(...parts: string[]): string[] {
     if (out.length >= 8) break;
   }
   return out;
-}
-
-function buildQuery(idea: ProductIdea): string {
-  const bits = [idea.title, idea.category].filter(Boolean).join(" ");
-  return `${bits} similar products`.trim();
 }
 
 function uniqueByDomain(results: SearchResult[], max: number): SearchResult[] {
@@ -57,75 +51,77 @@ function uniqueByDomain(results: SearchResult[], max: number): SearchResult[] {
   return out;
 }
 
-function buildInsights(idea: ProductIdea, competitors: Competitor[], priceRange: ResearchResult["benchmark"]["priceRange"]): string[] {
+function buildMakers(competitors: Competitor[]): Maker[] {
+  const map = new Map<string, { name: string; low: number | null; currency: string; count: number }>();
+  competitors.forEach((c) => {
+    if (!c.brand || c.brand.includes(".") || c.brand.length < 2) return;
+    const key = c.brand.toLowerCase();
+    const e = map.get(key) ?? { name: c.brand, low: null, currency: c.currency || "", count: 0 };
+    e.count += 1;
+    if (c.priceValue != null && (e.low == null || c.priceValue < e.low)) {
+      e.low = c.priceValue;
+      e.currency = c.currency || e.currency;
+    }
+    map.set(key, e);
+  });
+  return Array.from(map.values())
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 9)
+    .map((m) => ({
+      name: m.name,
+      offers: m.count,
+      lowestPrice: m.low != null ? `${m.currency === "USD" || !m.currency ? "$" : m.currency + " "}${Math.round(m.low)}` : "",
+    }));
+}
+
+function buildInsights(
+  idea: ProductIdea,
+  competitors: Competitor[],
+  suppliers: Supplier[],
+  priceRange: ResearchResult["benchmark"]["priceRange"]
+): string[] {
   const insights: string[] = [];
-  if (competitors.length) {
-    insights.push(`Found ${competitors.length} comparable product${competitors.length === 1 ? "" : "s"} currently on the market.`);
-  }
+  if (competitors.length) insights.push(`Benchmarked ${competitors.length} comparable products across online stores and the web.`);
   if (priceRange) {
-    const fmt = (n: number) => `${priceRange.currency || "$"}${Math.round(n)}`;
-    insights.push(`Market pricing ranges from ${fmt(priceRange.min)} to ${fmt(priceRange.max)} (avg ~${fmt(priceRange.avg)}).`);
+    const fmt = (n: number) => `${priceRange.currency === "USD" ? "$" : (priceRange.currency || "$") + " "}${Math.round(n)}`;
+    insights.push(`Retail pricing ranges from ${fmt(priceRange.min)} to ${fmt(priceRange.max)} (avg ~${fmt(priceRange.avg)}).`);
     const target = parsePrice(idea.priceTarget).value;
     if (target != null) {
-      if (target < priceRange.min) insights.push(`Your ${priceRange.currency || "$"}${target} target undercuts every competitor found — a potential value play.`);
-      else if (target > priceRange.max) insights.push(`Your ${priceRange.currency || "$"}${target} target sits above the market — lean into premium positioning.`);
-      else insights.push(`Your ${priceRange.currency || "$"}${target} target lands mid-market — differentiation on features will matter.`);
+      if (target < priceRange.min) insights.push(`Your ${fmt(target)} target undercuts every product found — a potential value play.`);
+      else if (target > priceRange.max) insights.push(`Your ${fmt(target)} target sits above the market — lean into premium positioning.`);
+      else insights.push(`Your ${fmt(target)} target lands mid-market — differentiation on features will matter.`);
     }
   }
-  // Most common features across competitors.
-  const featureCount = new Map<string, number>();
-  competitors.forEach((c) => c.features.forEach((f) => {
-    const key = f.trim().toLowerCase();
-    if (key.length > 2) featureCount.set(key, (featureCount.get(key) ?? 0) + 1);
-  }));
-  const common = Array.from(featureCount.entries()).filter(([, n]) => n >= 2).sort((a, b) => b[1] - a[1])[0];
-  if (common) insights.push(`"${common[0]}" appears across multiple competitors — consider it table stakes.`);
+  const ali = suppliers.filter((s) => s.source === "aliexpress" && s.price);
+  if (ali.length) {
+    const lows = ali.map((s) => parsePrice(s.price).value).filter((v): v is number => v != null);
+    if (lows.length) insights.push(`China suppliers list from ~$${Math.round(Math.min(...lows))}, suggesting healthy gross margin at retail prices.`);
+  }
   if (insights.length < 2) insights.push("Use the benchmark below to position pricing, features and messaging before committing to development.");
   return insights;
 }
 
-function buildEnrichment(idea: ProductIdea, competitors: Competitor[]) {
-  const tags = keywords(idea.title, idea.features, idea.category);
+function buildEnrichment(idea: ProductIdea, competitors: Competitor[], classification: Classification | null) {
+  const tags = classification?.keywords?.length ? classification.keywords.slice(0, 8) : keywords(idea.title, idea.features, idea.category);
+  const baseSummary = classification?.summary ? classification.summary : (idea.description ? idea.description.slice(0, 160) : "No description provided.");
   return {
-    suggestedCategory: idea.category || (competitors[0]?.brand ? "Consumer goods" : "Uncategorised"),
+    suggestedCategory: classification?.category || idea.category || "Uncategorised",
     tags,
     targetAudience: idea.audience || idea.targetMarket || "General consumers",
-    summary:
-      `"${idea.title}" benchmarked against ${competitors.length} live market product${competitors.length === 1 ? "" : "s"}. ` +
-      (idea.description ? idea.description.slice(0, 160) : "No description provided."),
+    summary: `${baseSummary} Benchmarked against ${competitors.length} product${competitors.length === 1 ? "" : "s"}.`,
   };
 }
 
-function priceRangeOf(competitors: Competitor[]): ResearchResult["benchmark"]["priceRange"] {
-  const values = competitors.map((c) => c.priceValue).filter((v): v is number => v != null && v > 0);
-  if (!values.length) return null;
-  const min = Math.min(...values);
-  const max = Math.max(...values);
-  const avg = values.reduce((a, b) => a + b, 0) / values.length;
-  const currency = competitors.find((c) => c.currency)?.currency || "USD";
-  return { min, max, avg, currency };
-}
-
-async function runLive(idea: ProductIdea, started: number): Promise<ResearchResult> {
-  const query = buildQuery(idea);
+async function benchmarkViaFirecrawl(query: string): Promise<{ competitors: Competitor[]; sources: { title: string; url: string }[]; found: number }> {
   const results = await search(query, 8);
-  const searchAgent: AgentRunInfo = {
-    id: "search",
-    name: "Market Discovery Agent",
-    description: "Searches the live web for similar products in the market.",
-    status: results.length ? "complete" : "error",
-    detail: results.length ? `Found ${results.length} candidate sources for “${query}”.` : "No web results returned.",
-  };
-
-  const candidates = uniqueByDomain(results, 6).slice(0, 5);
+  const candidates = uniqueByDomain(results, 4).slice(0, 3);
   const extractions = await Promise.allSettled(candidates.map((c) => extractProduct(c.url)));
 
-  const competitors: Competitor[] = [];
-  candidates.forEach((cand, i) => {
+  const competitors: Competitor[] = candidates.map((cand, i) => {
     const res = extractions[i];
     const data = res.status === "fulfilled" ? res.value : null;
     const priced = parsePrice(data?.price);
-    competitors.push({
+    return {
       name: data?.productName?.trim() || cand.title.replace(/\s*[-|–].*$/, "").trim(),
       brand: data?.brand?.trim() || domainOf(cand.url),
       price: data?.price?.trim() || "",
@@ -134,60 +130,64 @@ async function runLive(idea: ProductIdea, started: number): Promise<ResearchResu
       features: (data?.keyFeatures ?? []).slice(0, 5).map((f) => String(f).trim()).filter(Boolean),
       url: cand.url,
       source: domainOf(cand.url),
-    });
+      rating: null,
+      reviews: null,
+    };
   });
 
-  const withData = competitors.filter((c) => c.price || c.features.length).length;
-  const benchmarkAgent: AgentRunInfo = {
-    id: "benchmark",
-    name: "Benchmarking Agent",
-    description: "Extracts pricing and feature data from competitor pages.",
-    status: competitors.length ? "complete" : "error",
-    detail: `Benchmarked ${competitors.length} product${competitors.length === 1 ? "" : "s"} (${withData} with extracted pricing/features).`,
-  };
-
-  const priceRange = priceRangeOf(competitors);
-  const insights = buildInsights(idea, competitors, priceRange);
-  const enrichment = buildEnrichment(idea, competitors);
-
-  const insightAgent: AgentRunInfo = {
-    id: "insights",
-    name: "Insights Agent",
-    description: "Synthesises positioning, pricing and feature insights.",
-    status: "complete",
-    detail: `Generated ${insights.length} insights and ${enrichment.tags.length} tags.`,
-  };
-
   return {
-    mode: "live",
-    ranAt: new Date().toISOString(),
-    durationMs: Date.now() - started,
-    enrichment,
-    benchmark: { competitors, priceRange, insights },
-    agents: [searchAgent, benchmarkAgent, insightAgent],
-    sources: candidates.map((c) => ({ title: c.title, url: c.url })),
+    competitors,
+    sources: results.slice(0, 8).map((r) => ({ title: r.title, url: r.url })),
+    found: results.length,
   };
 }
 
+async function findWebSuppliers(productClass: string): Promise<Supplier[]> {
+  const results = await search(`${productClass} manufacturer supplier wholesale OEM`, 6);
+  return uniqueByDomain(results, 5)
+    .slice(0, 5)
+    .map((r) => ({ name: r.title.replace(/\s*[-|–].*$/, "").trim(), url: r.url, snippet: r.description, source: "web" }));
+}
+
+function dedupeCompetitors(rows: Competitor[]): Competitor[] {
+  const seen = new Set<string>();
+  return rows.filter((c) => {
+    const key = c.name.toLowerCase().slice(0, 40);
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function dedupeSuppliers(rows: Supplier[]): Supplier[] {
+  const seen = new Set<string>();
+  return rows.filter((s) => {
+    const key = (s.url || s.name).toLowerCase();
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
 function runDemo(idea: ProductIdea, started: number): ResearchResult {
-  // Deterministic placeholder so the workflow is demonstrable without an API key.
   const base = 25 + (idea.title.length % 7) * 6;
   const competitors: Competitor[] = [
-    { name: `${idea.category || "Market"} Leader Pro`, brand: "Northwind", price: `$${base + 20}`, priceValue: base + 20, currency: "USD", features: ["Premium materials", "2-year warranty", "Eco-friendly"], url: "https://example.com/a", source: "example.com" },
-    { name: `Everyday ${idea.category || "Product"}`, brand: "Brightway", price: `$${base}`, priceValue: base, currency: "USD", features: ["Affordable", "Lightweight", "Eco-friendly"], url: "https://example.com/b", source: "example.com" },
-    { name: `${idea.title} Alternative`, brand: "Marisol", price: `$${base + 10}`, priceValue: base + 10, currency: "USD", features: ["Compact", "Premium materials"], url: "https://example.com/c", source: "example.com" },
+    { name: `${idea.category || "Market"} Leader Pro`, brand: "Northwind", price: `$${base + 20}`, priceValue: base + 20, currency: "USD", features: ["Premium materials", "2-year warranty"], url: "https://example.com/a", source: "example.com", rating: 4.6, reviews: 1200 },
+    { name: `Everyday ${idea.category || "Product"}`, brand: "Brightway", price: `$${base}`, priceValue: base, currency: "USD", features: ["Affordable", "Lightweight"], url: "https://example.com/b", source: "example.com", rating: 4.2, reviews: 430 },
+    { name: `${idea.title} Alternative`, brand: "Marisol", price: `$${base + 10}`, priceValue: base + 10, currency: "USD", features: ["Compact"], url: "https://example.com/c", source: "example.com", rating: 4.4, reviews: 90 },
   ];
   const priceRange = priceRangeOf(competitors);
   return {
     mode: "demo",
     ranAt: new Date().toISOString(),
     durationMs: Date.now() - started,
-    enrichment: buildEnrichment(idea, competitors),
-    benchmark: { competitors, priceRange, insights: buildInsights(idea, competitors, priceRange) },
+    enrichment: buildEnrichment(idea, competitors, null),
+    benchmark: { competitors, priceRange, insights: buildInsights(idea, competitors, [], priceRange) },
+    makers: buildMakers(competitors),
+    suppliers: [],
     agents: [
-      { id: "search", name: "Market Discovery Agent", description: "Searches the live web for similar products.", status: "skipped", detail: "Demo mode — set FIRECRAWL_API_KEY for live web research." },
-      { id: "benchmark", name: "Benchmarking Agent", description: "Extracts pricing and feature data from competitors.", status: "complete", detail: "Generated sample benchmark data." },
-      { id: "insights", name: "Insights Agent", description: "Synthesises positioning insights.", status: "complete", detail: "Generated sample insights." },
+      { id: "amazon", name: "Online Stores", description: "Scans Amazon for live listings.", status: "skipped", detail: "Demo mode — set APIFY_API_TOKEN for live store data." },
+      { id: "benchmark", name: "Benchmarking", description: "Builds the competitor benchmark.", status: "complete", detail: "Generated sample benchmark data." },
     ],
     sources: [],
   };
@@ -196,39 +196,119 @@ function runDemo(idea: ProductIdea, started: number): ResearchResult {
 export async function runResearch(idea: ProductIdea): Promise<ResearchResult> {
   const started = Date.now();
 
-  let result: ResearchResult;
-  if (!firecrawlEnabled()) {
-    result = runDemo(idea, started);
-  } else {
-    try {
-      result = await runLive(idea, started);
-      // If live research yielded nothing usable, fall back to demo data.
-      if (!result.benchmark.competitors.length) result = runDemo(idea, started);
-    } catch (err) {
-      result = {
-        ...runDemo(idea, started),
-        error: err instanceof Error ? err.message : "Research failed",
-      };
-    }
+  if (!firecrawlEnabled() && !apifyEnabled() && !llmEnabled()) {
+    return runDemo(idea, started);
   }
 
-  // Strategy analyst layer — only runs when an Anthropic key is configured.
+  const agents: AgentRunInfo[] = [];
+
+  // 1. Classify (Claude, vision-aware) — drives search terms.
+  let classification: Classification | null = null;
   if (llmEnabled()) {
-    const analysis = await analyzeWithClaude(idea, result.benchmark.competitors, result.benchmark.priceRange);
+    classification = await classifyProduct(idea);
+    agents.push({
+      id: "classifier",
+      name: "Classifier",
+      description: "Classifies the product and derives search terms.",
+      status: classification ? "complete" : "error",
+      detail: classification ? `Class: ${classification.productClass} · ${classification.keywords.length} keywords.` : "Could not classify.",
+    });
+  }
+  const productClass = classification?.productClass || idea.category || idea.title;
+  const webQuery =
+    (classification?.keywords?.length ? classification.keywords.join(" ") : `${idea.title} ${idea.category}`.trim()) +
+    " similar products";
+
+  // 2. Run sources in parallel: Amazon (stores), Firecrawl (web), AliExpress (China suppliers), Firecrawl (web suppliers).
+  const [amazon, benchRes, aliexpress, webSuppliers] = await Promise.all([
+    apifyEnabled() ? amazonSearch(productClass, 8) : Promise.resolve<Competitor[]>([]),
+    firecrawlEnabled() ? benchmarkViaFirecrawl(webQuery) : Promise.resolve(null),
+    apifyEnabled() ? aliexpressSuppliers(productClass, 8) : Promise.resolve<Supplier[]>([]),
+    firecrawlEnabled() ? findWebSuppliers(productClass) : Promise.resolve<Supplier[]>([]),
+  ]);
+
+  if (apifyEnabled()) {
+    agents.push({
+      id: "amazon",
+      name: "Online Stores (Amazon)",
+      description: "Pulls live Amazon listings: brands, prices, ratings.",
+      status: amazon.length ? "complete" : "error",
+      detail: amazon.length ? `Found ${amazon.length} Amazon listings.` : "No Amazon listings found.",
+    });
+  }
+  if (firecrawlEnabled()) {
+    const fc = benchRes?.competitors ?? [];
+    agents.push({
+      id: "web",
+      name: "Web Research (Firecrawl)",
+      description: "Finds and extracts similar products across the web.",
+      status: benchRes && benchRes.found ? "complete" : "error",
+      detail: benchRes ? `Found ${benchRes.found} web sources · benchmarked ${fc.length}.` : "No web results.",
+    });
+  }
+  if (apifyEnabled()) {
+    agents.push({
+      id: "aliexpress",
+      name: "China Suppliers (AliExpress)",
+      description: "Finds China suppliers, wholesale prices and demand.",
+      status: aliexpress.length ? "complete" : "error",
+      detail: aliexpress.length ? `Found ${aliexpress.length} AliExpress suppliers.` : "No AliExpress results.",
+    });
+  }
+  if (firecrawlEnabled()) {
+    agents.push({
+      id: "web-suppliers",
+      name: "Web Sourcing (Firecrawl)",
+      description: "Finds manufacturers and suppliers on the web.",
+      status: webSuppliers.length ? "complete" : "error",
+      detail: webSuppliers.length ? `Found ${webSuppliers.length} supplier leads.` : "No suppliers found.",
+    });
+  }
+
+  // Combine sources.
+  const competitors = dedupeCompetitors([...amazon, ...(benchRes?.competitors ?? [])]).slice(0, 12);
+  const suppliers = dedupeSuppliers([...aliexpress, ...webSuppliers]).slice(0, 10);
+  const sources = benchRes?.sources ?? [];
+
+  const priceRange = priceRangeOf(competitors);
+  const makers = buildMakers(competitors);
+  const insights = buildInsights(idea, competitors, suppliers, priceRange);
+  const enrichment = buildEnrichment(idea, competitors, classification);
+
+  if (!competitors.length && !suppliers.length && !classification) {
+    return runDemo(idea, started);
+  }
+
+  const result: ResearchResult = {
+    mode: "live",
+    ranAt: new Date().toISOString(),
+    durationMs: 0,
+    enrichment,
+    classification,
+    benchmark: { competitors, priceRange, insights },
+    suppliers,
+    makers,
+    agents,
+    sources,
+  };
+
+  // Strategy analyst (Claude) — reasons over the combined benchmark.
+  if (llmEnabled()) {
+    const analysis = await analyzeWithClaude(idea, competitors, priceRange);
     if (analysis) {
       result.analysis = analysis;
-      result.agents.push({
+      agents.push({
         id: "analyst",
         name: "Strategy Analyst",
-        description: "Turns the benchmark into positioning, pricing and next steps.",
+        description: "Turns the research into positioning, pricing and next steps.",
         status: "complete",
         detail: `Produced positioning, ${analysis.differentiation.length} differentiators and ${analysis.nextSteps.length} next steps.`,
       });
     } else {
-      result.agents.push({
+      agents.push({
         id: "analyst",
         name: "Strategy Analyst",
-        description: "Turns the benchmark into positioning, pricing and next steps.",
+        description: "Turns the research into positioning, pricing and next steps.",
         status: "error",
         detail: "Analysis could not be generated.",
       });

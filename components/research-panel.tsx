@@ -20,14 +20,20 @@ import {
   DollarSign,
   ListChecks,
   ShieldAlert,
+  Store,
+  Factory,
+  Star,
+  Building2,
 } from "lucide-react";
 import type { ProductIdea, ResearchResult } from "@/lib/types";
 import { BenchmarkTable } from "@/components/benchmark-table";
 
 const PIPELINE = [
-  { id: "search", name: "Market Discovery Agent", description: "Searching the web for similar products…", icon: Search },
-  { id: "benchmark", name: "Benchmarking Agent", description: "Extracting competitor pricing & features…", icon: BarChart3 },
-  { id: "insights", name: "Insights Agent", description: "Synthesising positioning & insights…", icon: Lightbulb },
+  { id: "classify", name: "Classifier", description: "Classifying the product & deriving search terms…", icon: Tag },
+  { id: "stores", name: "Online Stores", description: "Scanning Amazon for live listings & prices…", icon: Store },
+  { id: "web", name: "Web Research", description: "Searching the web for similar products…", icon: Search },
+  { id: "suppliers", name: "China Suppliers", description: "Finding AliExpress & web suppliers…", icon: Factory },
+  { id: "analyst", name: "Strategy Analyst", description: "Synthesising positioning, pricing & next steps…", icon: Lightbulb },
 ];
 
 export function ResearchPanel({ idea, autoRun }: { idea: ProductIdea; autoRun: boolean }) {
@@ -248,6 +254,9 @@ function Results({ result }: { result: ResearchResult }) {
         <div className="mt-4 grid gap-4 sm:grid-cols-2">
           <InfoRow icon={Tag} label="Suggested category" value={result.enrichment.suggestedCategory} />
           <InfoRow icon={Users} label="Target audience" value={result.enrichment.targetAudience} />
+          {result.classification?.productClass && (
+            <InfoRow icon={Compass} label="Product class" value={result.classification.productClass} />
+          )}
         </div>
         {result.enrichment.tags.length > 0 && (
           <div className="mt-4 flex flex-wrap gap-2">
@@ -276,6 +285,69 @@ function Results({ result }: { result: ResearchResult }) {
           <BenchmarkTable benchmark={result.benchmark} />
         </div>
       </div>
+
+      {/* Makers — who's making it */}
+      {result.makers?.length ? (
+        <div>
+          <h2 className="flex items-center gap-2 text-lg font-bold text-slate-900">
+            <Building2 className="h-5 w-5 text-brand-600" /> Who&apos;s making it
+          </h2>
+          <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+            {result.makers.map((m) => (
+              <div key={m.name} className="flex items-center justify-between rounded-xl border border-slate-200 bg-white p-4">
+                <div className="min-w-0">
+                  <p className="truncate text-sm font-semibold text-slate-900">{m.name}</p>
+                  <p className="text-xs text-slate-500">{m.offers} listing{m.offers === 1 ? "" : "s"}</p>
+                </div>
+                {m.lowestPrice && <span className="ml-3 shrink-0 text-sm font-bold text-slate-900">from {m.lowestPrice}</span>}
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : null}
+
+      {/* Suppliers — sourcing */}
+      {result.suppliers?.length ? (
+        <div>
+          <h2 className="flex items-center gap-2 text-lg font-bold text-slate-900">
+            <Factory className="h-5 w-5 text-brand-600" /> Suppliers &amp; manufacturers
+          </h2>
+          <div className="mt-4 grid gap-3 sm:grid-cols-2">
+            {result.suppliers.map((s, i) => (
+              <a
+                key={i}
+                href={s.url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="block rounded-xl border border-slate-200 bg-white p-4 transition hover:border-brand-300 hover:shadow-soft"
+              >
+                <div className="flex items-start justify-between gap-2">
+                  <p className="flex items-center gap-1.5 text-sm font-semibold text-slate-900">
+                    <span className="line-clamp-1">{s.name}</span>
+                    <ExternalLink className="h-3.5 w-3.5 shrink-0 text-slate-400" />
+                  </p>
+                  {s.source === "aliexpress" && (
+                    <span className="shrink-0 rounded-md bg-orange-100 px-1.5 py-0.5 text-[10px] font-semibold text-orange-700">AliExpress</span>
+                  )}
+                </div>
+                {(s.price || s.orders != null || s.rating != null) && (
+                  <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-600">
+                    {s.price && <span className="font-semibold text-slate-900">{s.price}</span>}
+                    {s.rating != null && (
+                      <span className="inline-flex items-center gap-0.5">
+                        <Star className="h-3 w-3 fill-amber-400 text-amber-400" />
+                        {s.rating}
+                      </span>
+                    )}
+                    {s.orders != null && <span>{s.orders.toLocaleString()} orders</span>}
+                  </div>
+                )}
+                {s.snippet && <p className="mt-2 line-clamp-2 text-xs leading-relaxed text-slate-500">{s.snippet}</p>}
+              </a>
+            ))}
+          </div>
+        </div>
+      ) : null}
 
       {/* Insights */}
       {result.benchmark.insights.length > 0 && (

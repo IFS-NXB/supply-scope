@@ -25,6 +25,8 @@ export type Competitor = {
   features: string[];
   url: string;
   source: string;
+  rating?: number | null;
+  reviews?: number | null;
 };
 
 export type AgentRunInfo = {
@@ -33,6 +35,30 @@ export type AgentRunInfo = {
   description: string;
   status: "complete" | "error" | "skipped";
   detail: string;
+};
+
+export type Classification = {
+  category: string;
+  productClass: string;
+  keywords: string[];
+  attributes: string[];
+  summary: string;
+};
+
+export type Supplier = {
+  name: string;
+  url: string;
+  snippet: string;
+  price?: string;
+  orders?: number | null;
+  rating?: number | null;
+  source?: string;
+};
+
+export type Maker = {
+  name: string;
+  offers: number;
+  lowestPrice: string;
 };
 
 export type ResearchResult = {
@@ -50,6 +76,9 @@ export type ResearchResult = {
     priceRange: { min: number; max: number; avg: number; currency: string } | null;
     insights: string[];
   };
+  classification?: Classification | null;
+  suppliers?: Supplier[];
+  makers?: Maker[];
   analysis?: {
     summary: string;
     positioning: string;

@@ -1,5 +1,5 @@
 import Anthropic from "@anthropic-ai/sdk";
-import type { Competitor, ProductIdea, ResearchResult } from "./types";
+import type { Classification, Competitor, ProductIdea, ResearchResult } from "./types";
 
 export type CompetitiveAnalysis = {
   summary: string;
@@ -60,6 +60,67 @@ function buildPrompt(
     "",
     "Produce a concise, decision-useful competitive analysis. Reference specific competitors and pricing where relevant. Be concrete and avoid generic filler.",
   ].join("\n");
+}
+
+const CLASSIFICATION_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    category: { type: "string", description: "Broad product category, e.g. 'Drinkware & Kitchen'." },
+    productClass: { type: "string", description: "Concise product class to search for to find similar products, e.g. 'insulated stainless steel water bottle'." },
+    keywords: { type: "array", items: { type: "string" }, description: "3-6 search keywords for finding comparable products." },
+    attributes: { type: "array", items: { type: "string" }, description: "Notable attributes/materials/features inferred." },
+    summary: { type: "string", description: "One-line description of what the product is." },
+  },
+  required: ["category", "productClass", "keywords", "attributes", "summary"],
+};
+
+function imageBlock(imageUrl: string): any | null {
+  if (!imageUrl) return null;
+  const m = imageUrl.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
+  if (m) return { type: "image", source: { type: "base64", media_type: m[1], data: m[2] } };
+  if (/^https?:\/\//.test(imageUrl)) return { type: "image", source: { type: "url", url: imageUrl } };
+  return null;
+}
+
+export async function classifyProduct(idea: ProductIdea): Promise<Classification | null> {
+  if (!llmEnabled()) return null;
+  const client = new Anthropic();
+
+  const content: any[] = [];
+  const img = imageBlock(idea.imageUrl);
+  if (img) content.push(img);
+  content.push({
+    type: "text",
+    text:
+      "Classify this product idea for market research. Use the image if one is provided.\n" +
+      `Title: ${idea.title}\n` +
+      `Description: ${idea.description || "(none)"}\n` +
+      `Stated category: ${idea.category || "(none)"}\n` +
+      `Features: ${idea.features || "(none)"}\n\n` +
+      "Return the category, a concise product class to search for, search keywords, key attributes, and a one-line summary.",
+  });
+
+  const params: any = {
+    model: MODEL,
+    max_tokens: 1200,
+    output_config: {
+      effort: "low",
+      format: { type: "json_schema", schema: CLASSIFICATION_SCHEMA },
+    },
+    messages: [{ role: "user", content }],
+  };
+
+  try {
+    const res = await client.messages.create(params);
+    const block = (res.content as any[]).find((b) => b.type === "text");
+    if (!block?.text) return null;
+    const parsed = JSON.parse(block.text) as Classification;
+    if (!parsed.productClass) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
 }
 
 export async function analyzeWithClaude(

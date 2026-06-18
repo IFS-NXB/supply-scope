@@ -1,0 +1,2696 @@
+From fb168dcbc2981a012cc3bed74e944425ac23157d Mon Sep 17 00:00:00 2001
+From: Claude Code <noreply@anthropic.com>
+Date: Thu, 18 Jun 2026 12:55:31 +0000
+Subject: [PATCH] Add "Validate" view: SupplyScope product-idea research merged
+ into RSI
+
+Ports SupplyScope's "submit a product idea -> multi-agent research &
+benchmark" capability into the dashboard as a new "Validate" view, restyled
+into the NxB plain-CSS design system (no Tailwind). The existing snapshot/
+trends pipeline and views are otherwise untouched.
+
+- web/components/views/ideas.tsx: submission form, animated pipeline,
+  results (benchmark, suppliers, makers, strategy analysis, sources) and a
+  "Recently validated" read-back list (View reopens past results).
+- web/components/views/insights.tsx: completed ideas also surface as scored
+  procurement insights (client-side fetch of /api/ideas; live Supabase or the
+  in-memory store), tagged "Validate" and counted in a "From Validate" tile.
+- web/app/api/ideas[/[id]/research]: server routes (nodejs, force-dynamic);
+  keys ANTHROPIC_API_KEY||RSI_ANTHROPIC_API_KEY, FIRECRAWL_API_KEY,
+  APIFY_API_TOKEN; deterministic demo data when no keys are set.
+- web/lib/ideas/*: ported agent logic (Claude via raw fetch, Firecrawl,
+  Apify), server-only service-role writes, in-memory fallback (no disk).
+- integration.ts fans research onto product_categories/suppliers/
+  competitors + a triggers row; never writes snapshots or insights.
+- pipelines/src/rsi/models.py: ProductIdea model (incl. category, audience,
+  features, submitted_by); supabase/migrations/0006_product_ideas.sql.
+- web/.env.example: ANTHROPIC/FIRECRAWL/APIFY + SUPABASE service-role keys.
+
+Build, typecheck, and lint pass.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AMzxphoQZ5gqWuay5LMrC1
+---
+ pipelines/src/rsi/models.py                |  33 +
+ supabase/migrations/0006_product_ideas.sql |  27 +
+ web/.env.example                           |  20 +
+ web/app/api/ideas/[id]/research/route.ts   |  56 ++
+ web/app/api/ideas/route.ts                 |  51 ++
+ web/app/app.css                            | 129 ++++
+ web/components/Dashboard.tsx               |   3 +
+ web/components/sidebar.tsx                 |   1 +
+ web/components/views/ideas.tsx             | 804 +++++++++++++++++++++
+ web/components/views/insights.tsx          |  75 +-
+ web/lib/ideas/agents.ts                    | 322 +++++++++
+ web/lib/ideas/apify.ts                     | 124 ++++
+ web/lib/ideas/firecrawl.ts                 |  98 +++
+ web/lib/ideas/integration.ts               | 164 +++++
+ web/lib/ideas/llm.ts                       | 175 +++++
+ web/lib/ideas/price.ts                     |  28 +
+ web/lib/ideas/store.ts                     | 163 +++++
+ web/lib/ideas/supabase-admin.ts            |  38 +
+ web/lib/ideas/types.ts                     | 109 +++
+ web/lib/types.ts                           |   3 +-
+ 20 files changed, 2416 insertions(+), 7 deletions(-)
+ create mode 100644 supabase/migrations/0006_product_ideas.sql
+ create mode 100644 web/app/api/ideas/[id]/research/route.ts
+ create mode 100644 web/app/api/ideas/route.ts
+ create mode 100644 web/components/views/ideas.tsx
+ create mode 100644 web/lib/ideas/agents.ts
+ create mode 100644 web/lib/ideas/apify.ts
+ create mode 100644 web/lib/ideas/firecrawl.ts
+ create mode 100644 web/lib/ideas/integration.ts
+ create mode 100644 web/lib/ideas/llm.ts
+ create mode 100644 web/lib/ideas/price.ts
+ create mode 100644 web/lib/ideas/store.ts
+ create mode 100644 web/lib/ideas/supabase-admin.ts
+ create mode 100644 web/lib/ideas/types.ts
+
+diff --git a/pipelines/src/rsi/models.py b/pipelines/src/rsi/models.py
+index f24af1f..e598467 100644
+--- a/pipelines/src/rsi/models.py
++++ b/pipelines/src/rsi/models.py
+@@ -235,6 +235,39 @@ class Insight(Base):
+     status: Mapped[str] = mapped_column(String(16), default="new")
+ 
+ 
++class ProductIdea(Base):
++    """A user-submitted product concept evaluated by the "Validate" feature.
++
++    The web app's ``/api/ideas`` routes run a multi-agent research pass
++    (classification, store/competitor benchmark, suppliers, strategy analysis)
++    and store the full result in ``research``. The analysis is also fanned out
++    onto the canonical tables — ``suppliers``, ``competitors`` and a row in
++    ``triggers`` — so submitted ideas surface in the dashboard's pipeline.
++
++    NOTE: this models.py is the single source of truth for the schema; the
++    matching DDL lives in supabase/migrations (regenerate, don't hand-edit, per
++    the repo convention) — see 0006_product_ideas.sql.
++    """
++
++    __tablename__ = "product_ideas"
++
++    id: Mapped[str] = mapped_column(String(36), primary_key=True)  # UUID from the web app
++    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
++    title: Mapped[str] = mapped_column(String(256), nullable=False)
++    description: Mapped[str] = mapped_column(String(4096), default="")
++    category_id: Mapped[int | None] = mapped_column(ForeignKey("product_categories.id"))
++    image_url: Mapped[str | None] = mapped_column(String(2048))
++    target_market: Mapped[str | None] = mapped_column(String(256))
++    target_price: Mapped[str | None] = mapped_column(String(64))
++    # Free-text inputs kept alongside the resolved category_id.
++    category: Mapped[str | None] = mapped_column(String(128))
++    audience: Mapped[str | None] = mapped_column(String(256))
++    features: Mapped[str | None] = mapped_column(String(4096))
++    submitted_by: Mapped[str | None] = mapped_column(String(128))
++    status: Mapped[str] = mapped_column(String(16), default="queued")  # queued|researching|complete|error
++    research: Mapped[dict] = mapped_column(JSON, default=dict)
++
++
+ class Snapshot(Base):
+     """Published read-model the dashboard consumes (the `rsi export` output).
+ 
+diff --git a/supabase/migrations/0006_product_ideas.sql b/supabase/migrations/0006_product_ideas.sql
+new file mode 100644
+index 0000000..2b03077
+--- /dev/null
++++ b/supabase/migrations/0006_product_ideas.sql
+@@ -0,0 +1,27 @@
++-- Add the product_ideas table for the "Validate" feature (submit a product idea
++-- -> multi-agent research & benchmark). Additive; models.py is the source of
++-- truth (regenerate, don't hand-edit, per the repo convention).
++--
++-- The web app writes rows via the service-role key; the idea's analysis is also
++-- fanned out onto suppliers / competitors / triggers (no snapshots row).
++
++CREATE TABLE IF NOT EXISTS product_ideas (
++	id VARCHAR(36) NOT NULL,
++	created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
++	title VARCHAR(256) NOT NULL,
++	description VARCHAR(4096) NOT NULL DEFAULT '',
++	category_id INTEGER,
++	image_url VARCHAR(2048),
++	target_market VARCHAR(256),
++	target_price VARCHAR(64),
++	category VARCHAR(128),
++	audience VARCHAR(256),
++	features VARCHAR(4096),
++	submitted_by VARCHAR(128),
++	status VARCHAR(16) NOT NULL DEFAULT 'queued',
++	research JSON NOT NULL DEFAULT '{}',
++	PRIMARY KEY (id),
++	FOREIGN KEY(category_id) REFERENCES product_categories (id)
++);
++
++CREATE INDEX IF NOT EXISTS product_ideas_created_at_idx ON product_ideas (created_at DESC);
+diff --git a/web/.env.example b/web/.env.example
+index 8cf4c7c..7a6338b 100644
+--- a/web/.env.example
++++ b/web/.env.example
+@@ -10,3 +10,23 @@
+ #   Project API keys (anon/public) -> NEXT_PUBLIC_SUPABASE_ANON_KEY
+ NEXT_PUBLIC_SUPABASE_URL=
+ NEXT_PUBLIC_SUPABASE_ANON_KEY=
++
++# ---------------------------------------------------------------------------
++# "Validate" feature (submit a product idea -> multi-agent research) — all
++# server-side only. Each is optional: with none set, the pipeline returns
++# deterministic demo data so the page still works.
++# ---------------------------------------------------------------------------
++# Anthropic key (classifier + strategy analyst). ANTHROPIC_API_KEY is already
++# used by the existing /api/extract route; the research routes also accept the
++# pipeline's RSI_ANTHROPIC_API_KEY as a fallback.
++ANTHROPIC_API_KEY=
++# Firecrawl (web research + per-page product extraction).
++FIRECRAWL_API_KEY=
++# Apify (Amazon online-store listings + AliExpress China suppliers).
++APIFY_API_TOKEN=
++# Service-role Supabase access for trusted writes (product_ideas, suppliers,
++# competitors, triggers). NEVER prefix with NEXT_PUBLIC. SUPABASE_URL falls back
++# to NEXT_PUBLIC_SUPABASE_URL when unset. With these unset, ideas persist to an
++# in-memory store for the session.
++SUPABASE_URL=
++SUPABASE_SERVICE_ROLE_KEY=
+diff --git a/web/app/api/ideas/[id]/research/route.ts b/web/app/api/ideas/[id]/research/route.ts
+new file mode 100644
+index 0000000..82db599
+--- /dev/null
++++ b/web/app/api/ideas/[id]/research/route.ts
+@@ -0,0 +1,56 @@
++import { NextResponse } from "next/server";
++
++import { runResearch } from "@/lib/ideas/agents";
++import { connectResearch } from "@/lib/ideas/integration";
++import { getIdea, updateIdea } from "@/lib/ideas/store";
++
++/**
++ * Runs the multi-agent research pipeline for one idea, persists the result, and
++ * fans it out into RSI's shared tables (best-effort).
++ *
++ *   POST /api/ideas/[id]/research → { idea }   run the pipeline
++ *   GET  /api/ideas/[id]/research → { status } poll current status
++ *
++ * Key resolution (server env only):
++ *   ANTHROPIC_API_KEY || RSI_ANTHROPIC_API_KEY  → classifier + strategy analyst
++ *   FIRECRAWL_API_KEY                           → web research / web suppliers
++ *   APIFY_API_TOKEN                             → Amazon + AliExpress agents
++ * With no keys the pipeline returns deterministic demo data so the page works.
++ */
++export const runtime = "nodejs";
++export const dynamic = "force-dynamic";
++export const maxDuration = 300;
++
++export async function GET(_req: Request, { params }: { params: { id: string } }) {
++  const idea = await getIdea(params.id);
++  if (!idea) return NextResponse.json({ error: "Idea not found" }, { status: 404 });
++  return NextResponse.json({ id: idea.id, status: idea.status, hasResearch: Boolean(idea.research) });
++}
++
++export async function POST(_req: Request, { params }: { params: { id: string } }) {
++  const idea = await getIdea(params.id);
++  if (!idea) {
++    return NextResponse.json({ error: "Idea not found" }, { status: 404 });
++  }
++
++  await updateIdea(idea.id, { status: "researching" });
++
++  try {
++    const research = await runResearch(idea);
++    const updated = await updateIdea(idea.id, {
++      status: research.error ? "error" : "complete",
++      research,
++    });
++    // Fan results out into the shared RSI tables (best-effort, never blocks).
++    if (!research.error) {
++      await connectResearch(updated ?? idea, research);
++    }
++    return NextResponse.json({ idea: updated });
++  } catch (err) {
++    const updated = await updateIdea(idea.id, { status: "error" });
++    return NextResponse.json(
++      { idea: updated, error: err instanceof Error ? err.message : "Research failed" },
++      { status: 500 }
++    );
++  }
++}
+diff --git a/web/app/api/ideas/route.ts b/web/app/api/ideas/route.ts
+new file mode 100644
+index 0000000..8f6eda3
+--- /dev/null
++++ b/web/app/api/ideas/route.ts
+@@ -0,0 +1,51 @@
++import { NextResponse } from "next/server";
++
++import { createIdea, listIdeas } from "@/lib/ideas/store";
++
++/**
++ * Product-idea collection endpoint for the "Validate" view.
++ *
++ *   GET  /api/ideas  → { ideas }      list submitted ideas (newest first)
++ *   POST /api/ideas  → { idea }       create a queued idea (then the client
++ *                                      POSTs /api/ideas/[id]/research to run it)
++ *
++ * Persistence falls back to an in-memory store when Supabase is not configured,
++ * so the feature works without a database. Heavy AI work lives in the research
++ * route, never here.
++ */
++export const runtime = "nodejs";
++export const dynamic = "force-dynamic";
++export const maxDuration = 30;
++
++export async function GET() {
++  const ideas = await listIdeas();
++  return NextResponse.json({ ideas });
++}
++
++export async function POST(req: Request) {
++  let body: Record<string, unknown>;
++  try {
++    body = await req.json();
++  } catch {
++    return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
++  }
++
++  if (!body?.title || typeof body.title !== "string" || !body.title.trim()) {
++    return NextResponse.json({ error: "A product title is required." }, { status: 400 });
++  }
++
++  const str = (v: unknown) => (typeof v === "string" ? v : undefined);
++  const idea = await createIdea({
++    title: body.title,
++    description: str(body.description),
++    category: str(body.category),
++    targetMarket: str(body.targetMarket),
++    audience: str(body.audience),
++    priceTarget: str(body.priceTarget),
++    features: str(body.features),
++    imageUrl: str(body.imageUrl),
++    submittedBy: str(body.submittedBy),
++  });
++
++  return NextResponse.json({ idea }, { status: 201 });
++}
+diff --git a/web/app/app.css b/web/app/app.css
+index 31148be..be5fe36 100644
+--- a/web/app/app.css
++++ b/web/app/app.css
+@@ -437,10 +437,137 @@ body { background: var(--nxb-surface-page); color: var(--nxb-text-primary); font
+ .pill .x { opacity: .55; font-size: 13px; line-height: 1; margin-left: 2px; }
+ .pill .x:hover { opacity: 1; }
+ 
++/* ---------------- Validate (product idea) ---------------- */
++/* Form inputs — the dashboard had no form controls before this view. */
++.nxb-input { width: 100%; font-family: var(--font-sans); font-size: 13.5px; color: var(--nxb-text-primary); background: var(--nxb-surface-page); border: 0.5px solid var(--nxb-border-medium); border-radius: var(--radius-input); padding: 9px 12px; transition: 120ms; line-height: 1.45; }
++.nxb-input::placeholder { color: var(--nxb-text-disabled); }
++.nxb-input:focus { outline: none; border-color: var(--nxb-border-focus); background: var(--nxb-surface-1); }
++textarea.nxb-input { resize: vertical; min-height: 60px; }
++
++.field { display: block; }
++.field-label { font-size: 13px; font-weight: 500; color: var(--nxb-text-primary); }
++.field-req { color: var(--nxb-action-primary); }
++.field-hint { display: block; font-size: 11.5px; color: var(--nxb-text-muted); margin-top: 2px; line-height: 1.4; }
++.field-control { margin-top: 7px; }
++.field-row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
++
++.ideas-form-grid { display: grid; grid-template-columns: 1fr 300px; gap: 20px; align-items: start; }
++.idea-form { display: flex; flex-direction: column; gap: 18px; }
++.idea-form-foot { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
++.idea-form-note { font-size: 12.5px; color: var(--nxb-text-muted); }
++
++.dropzone { border: 1px dashed var(--nxb-border-medium); border-radius: var(--radius-input); background: var(--nxb-surface-page); padding: 14px; }
++.dropzone-btn { width: 100%; background: none; border: 0; cursor: pointer; display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 14px 0; color: var(--nxb-text-muted); }
++.dropzone-btn svg { opacity: .7; }
++.dropzone-main { font-size: 13px; font-weight: 500; color: var(--nxb-text-secondary); }
++.dropzone-sub { font-family: var(--font-mono); font-size: 10.5px; }
++.dropzone-preview { display: flex; align-items: center; gap: 14px; }
++.dropzone-thumb { width: 64px; height: 64px; border-radius: var(--radius-input); object-fit: cover; border: 0.5px solid var(--nxb-border-low); }
++.hidden-input { display: none; }
++.dropzone-url { margin-top: 12px; }
++
++.idea-aside { position: sticky; top: 84px; }
++.idea-aside-lead { font-size: 13px; color: var(--nxb-text-secondary); line-height: 1.5; margin: 0 0 16px; }
++.agent-steps { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 16px; }
++.agent-step { display: flex; gap: 11px; align-items: flex-start; }
++.agent-step-icon { width: 30px; height: 30px; flex: 0 0 30px; border-radius: var(--radius-input); background: var(--nxb-action-inverse); color: var(--nxb-action-inverse-text); display: inline-flex; align-items: center; justify-content: center; }
++.agent-step-name { font-size: 13px; font-weight: 500; margin: 0; }
++.agent-step-desc { font-size: 11.5px; color: var(--nxb-text-muted); margin: 2px 0 0; line-height: 1.45; }
++
++/* Running pipeline */
++.idea-banner { display: flex; align-items: center; gap: 14px; }
++.idea-banner-icon { width: 40px; height: 40px; flex: 0 0 40px; border-radius: var(--radius-input); background: linear-gradient(135deg, var(--nxb-action-primary-from), var(--nxb-action-primary-to)); color: #fff; display: inline-flex; align-items: center; justify-content: center; }
++.idea-banner-title { font-size: 15px; font-weight: 500; margin: 0; }
++.idea-banner-sub { font-size: 12.5px; color: var(--nxb-text-muted); margin: 3px 0 0; }
++.pipeline-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 14px; }
++.pipeline-card { background: var(--nxb-surface-1); border: 0.5px solid var(--nxb-border-low); border-radius: var(--radius-card); padding: 16px; transition: 150ms; }
++.pipeline-card.active { border-color: color-mix(in srgb, var(--nxb-action-primary) 45%, transparent); background: color-mix(in srgb, var(--nxb-action-primary) 5%, var(--nxb-surface-1)); }
++.pipeline-card.pending { opacity: .6; }
++.pipeline-card-top { display: flex; align-items: center; justify-content: space-between; }
++.pipeline-card-icon { width: 30px; height: 30px; flex: 0 0 30px; border-radius: var(--radius-input); background: var(--nxb-action-inverse); color: var(--nxb-action-inverse-text); display: inline-flex; align-items: center; justify-content: center; }
++.pipeline-card.pending .pipeline-card-icon { background: var(--nxb-surface-3); color: var(--nxb-text-disabled); }
++.pipeline-card.done .pipeline-card-top > svg, .pipeline-card.active .pipeline-card-top > svg { color: var(--nxb-action-primary); }
++.pipeline-dot { width: 7px; height: 7px; border-radius: 9999px; background: var(--nxb-text-disabled); }
++.pipeline-card-name { font-size: 13px; font-weight: 500; margin: 12px 0 0; }
++.pipeline-card-desc { font-size: 11.5px; color: var(--nxb-text-muted); margin: 4px 0 0; line-height: 1.45; }
++.spinner { width: 15px; height: 15px; border-radius: 9999px; border: 2px solid var(--nxb-border-medium); border-top-color: var(--nxb-action-primary); animation: spin 0.7s linear infinite; }
++
++/* Results */
++.ideas-results { display: flex; flex-direction: column; gap: 24px; }
++.section-h { margin: 0 0 12px; }
++.analysis-summary { font-size: 14.5px; line-height: 1.55; color: var(--nxb-text-secondary); margin: 0 0 18px; }
++.analysis-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 18px 24px; margin-bottom: 18px; }
++.analysis-block + .analysis-block { margin-top: 0; }
++.analysis-block-h { font-family: var(--font-mono); font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--nxb-text-muted); display: flex; align-items: center; gap: 6px; margin: 0 0 8px; }
++.analysis-block-h svg { color: var(--nxb-action-primary); opacity: .85; }
++.analysis-text { font-size: 13.5px; line-height: 1.55; color: var(--nxb-text-secondary); margin: 0; }
++.analysis-text.muted { color: var(--nxb-text-disabled); }
++.analysis-price { font-size: 19px; font-weight: 500; letter-spacing: -0.4px; margin: 0; }
++.analysis-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
++.analysis-list li { display: flex; gap: 9px; align-items: flex-start; font-size: 13px; line-height: 1.45; color: var(--nxb-text-secondary); }
++.analysis-dot { width: 6px; height: 6px; border-radius: 9999px; margin-top: 6px; flex: 0 0 6px; }
++.analysis-dot.low { background: var(--nxb-status-low); }
++.analysis-dot.med { background: var(--nxb-status-medium); }
++.next-steps { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 10px; }
++.next-steps li { display: flex; gap: 10px; align-items: flex-start; font-size: 13px; line-height: 1.45; color: var(--nxb-text-secondary); }
++.next-step-num { width: 20px; height: 20px; flex: 0 0 20px; border-radius: 9999px; background: var(--nxb-action-inverse); color: var(--nxb-action-inverse-text); font-family: var(--font-mono); font-size: 10px; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; }
++
++.agent-activity-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
++.agent-activity-top { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
++.agent-activity-name { font-size: 13px; font-weight: 500; margin: 0; }
++.agent-activity-detail { font-size: 11.5px; color: var(--nxb-text-muted); margin: 8px 0 0; line-height: 1.5; }
++
++.enrich-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 16px; }
++.info-row { display: flex; align-items: center; gap: 11px; border: 0.5px solid var(--nxb-border-low); background: var(--nxb-surface-page); border-radius: var(--radius-input); padding: 11px 13px; }
++.info-row-icon { width: 30px; height: 30px; flex: 0 0 30px; border-radius: var(--radius-input); background: var(--nxb-surface-1); border: 0.5px solid var(--nxb-border-low); color: var(--nxb-action-primary); display: inline-flex; align-items: center; justify-content: center; }
++.info-row-label { font-size: 11px; color: var(--nxb-text-muted); margin: 0; }
++.info-row-value { font-size: 13px; font-weight: 500; margin: 2px 0 0; }
++.enrich-tags { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 16px; }
++
++.td-source { font-size: 10.5px; color: var(--nxb-text-muted); font-family: var(--font-mono); }
++.dtable tbody tr.no-cursor { cursor: default; vertical-align: top; }
++.feat-chips { display: flex; flex-wrap: wrap; gap: 5px; }
++.feat-chip { font-size: 11px; color: var(--nxb-text-secondary); background: var(--nxb-overlay-subtle); border: 0.5px solid var(--nxb-border-low); padding: 2px 7px; border-radius: var(--radius-badge); }
++
++.maker-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
++.maker-card { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 16px; }
++.maker-id { min-width: 0; }
++.maker-name { font-size: 13px; font-weight: 500; margin: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
++.maker-offers { font-size: 11px; color: var(--nxb-text-muted); margin: 2px 0 0; }
++.maker-price { font-size: 13px; font-weight: 500; white-space: nowrap; flex: 0 0 auto; }
++
++.supplier-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
++.supplier-card { display: block; padding: 14px 16px; cursor: pointer; transition: 150ms; text-decoration: none; color: inherit; }
++.supplier-card:hover { background: var(--nxb-overlay-subtle); border-color: var(--nxb-border-medium); }
++.supplier-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
++.supplier-name { font-size: 13px; font-weight: 500; display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
++.supplier-name svg { color: var(--nxb-text-muted); flex: 0 0 13px; }
++.supplier-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-top: 8px; font-size: 11.5px; color: var(--nxb-text-muted); }
++.supplier-price { font-weight: 500; color: var(--nxb-text-primary); }
++.supplier-snippet { font-size: 11.5px; color: var(--nxb-text-muted); line-height: 1.45; margin: 8px 0 0; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
++
++.source-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 9px; }
++.source-list .link-btn { color: var(--nxb-text-secondary); }
++.source-list .link-btn:hover { color: var(--nxb-text-link); }
++.idea-foot-note { font-family: var(--font-mono); font-size: 10.5px; color: var(--nxb-text-muted); margin: 0; }
++
++/* Recently validated (read-back list) */
++.idea-recent { margin-top: 4px; }
++.idea-recent-list { list-style: none; margin: 12px 0 0; padding: 0; display: flex; flex-direction: column; }
++.idea-recent-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 11px 2px; border-top: 0.5px solid var(--nxb-border-low); }
++.idea-recent-row:first-child { border-top: 0; }
++.idea-recent-main { display: flex; align-items: center; gap: 10px; min-width: 0; }
++.idea-recent-title { font-size: 13px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
++.idea-recent-meta { display: flex; align-items: center; gap: 14px; flex: 0 0 auto; }
++
+ /* ---------------- Responsive ---------------- */
+ @media (max-width: 1100px) {
+   .ov-grid, .dd-grid, .map-grid { grid-template-columns: 1fr; }
+   .sgrid { grid-template-columns: 1fr; }
++  .ideas-form-grid { grid-template-columns: 1fr; }
++  .idea-aside { position: static; }
++  .pipeline-grid { grid-template-columns: repeat(2, 1fr); }
++  .agent-activity-grid, .maker-grid { grid-template-columns: repeat(2, 1fr); }
+ }
+ @media (max-width: 720px) {
+   .app { grid-template-columns: 1fr; }
+@@ -448,4 +575,6 @@ body { background: var(--nxb-surface-page); color: var(--nxb-text-primary); font
+   .stat-row { grid-template-columns: repeat(2, 1fr); }
+   .tcard { grid-template-columns: 1fr; }
+   .tcard-r { border-left: 0; padding-left: 0; border-top: 0.5px solid var(--nxb-border-low); padding-top: 16px; flex-direction: row; flex-wrap: wrap; }
++  .field-row, .analysis-grid, .enrich-grid, .supplier-grid { grid-template-columns: 1fr; }
++  .pipeline-grid, .agent-activity-grid, .maker-grid { grid-template-columns: 1fr; }
+ }
+diff --git a/web/components/Dashboard.tsx b/web/components/Dashboard.tsx
+index 085fabc..a82b4c7 100644
+--- a/web/components/Dashboard.tsx
++++ b/web/components/Dashboard.tsx
+@@ -17,6 +17,7 @@ import { MapView } from "./views/mapview";
+ import { Suppliers } from "./views/suppliers";
+ import { SupplierDrawer } from "./views/supplier-drawer";
+ import { Shortlist } from "./views/shortlist";
++import { Ideas } from "./views/ideas";
+ import { QuoteModal } from "./views/quote-modal";
+ 
+ export function Dashboard({ model }: { model: Model }) {
+@@ -80,6 +81,7 @@ export function Dashboard({ model }: { model: Model }) {
+     map: ["Lidl · Buying", "Supply-chain map"],
+     suppliers: supCtx ? ["Trending", supCtx.cat, "Suppliers"] : ["Lidl · Buying", "Suppliers"],
+     shortlist: ["Lidl · Buying", "Shortlist"],
++    ideas: ["Lidl · Buying", "Validate"],
+   };
+ 
+   const requestQuote = (ids: string[]) => setQuoteIds(ids);
+@@ -132,6 +134,7 @@ export function Dashboard({ model }: { model: Model }) {
+                 requestQuote={requestQuote}
+               />
+             )}
++            {view === "ideas" && <Ideas />}
+             <SourceFooter />
+           </div>
+         </main>
+diff --git a/web/components/sidebar.tsx b/web/components/sidebar.tsx
+index f32750f..488937e 100644
+--- a/web/components/sidebar.tsx
++++ b/web/components/sidebar.tsx
+@@ -100,6 +100,7 @@ export function Sidebar({ view, go, shortlistCount }: { view: View; go: Go; shor
+         <NavItem id="map" label="Map" icon="globe" view={view} go={go} />
+         <NavItem id="suppliers" label="Suppliers" icon="factory" badge={SUPPLIERS.length} view={view} go={go} />
+         <NavItem id="shortlist" label="Shortlist" icon="bookmark" badge={shortlistCount || null} view={view} go={go} />
++        <NavItem id="ideas" label="Validate" icon="box" view={view} go={go} />
+       </div>
+       <SignalSources sources={signalSources} />
+       <div className="nav-section">Markets</div>
+diff --git a/web/components/views/ideas.tsx b/web/components/views/ideas.tsx
+new file mode 100644
+index 0000000..c8633ca
+--- /dev/null
++++ b/web/components/views/ideas.tsx
+@@ -0,0 +1,804 @@
++"use client";
++
++import { useCallback, useEffect, useRef, useState } from "react";
++import type { ProductIdea, ResearchResult } from "@/lib/ideas/types";
++import { cc } from "@/lib/util";
++import { Icons } from "../icons";
++import { StatTile } from "./shared";
++
++const CATEGORIES = [
++  "Apparel & Fashion",
++  "Drinkware & Kitchen",
++  "Home & Living",
++  "Baby & Kids",
++  "Beauty & Personal Care",
++  "Sports & Outdoors",
++  "Electronics & Accessories",
++  "Pet Products",
++];
++
++const MAX_IMAGE_BYTES = 1_500_000;
++
++const PIPELINE = [
++  { id: "classify", name: "Classifier", desc: "Classifying the product & deriving search terms…", icon: "spark" as const },
++  { id: "stores", name: "Online Stores", desc: "Scanning Amazon for live listings & prices…", icon: "box" as const },
++  { id: "web", name: "Web Research", desc: "Searching the web for similar products…", icon: "search" as const },
++  { id: "suppliers", name: "China Suppliers", desc: "Finding AliExpress & web suppliers…", icon: "factory" as const },
++  { id: "analyst", name: "Strategy Analyst", desc: "Synthesising positioning, pricing & next steps…", icon: "pulse" as const },
++];
++
++type Stage = "form" | "running" | "results" | "error";
++
++export function Ideas() {
++  const [stage, setStage] = useState<Stage>("form");
++  const [idea, setIdea] = useState<ProductIdea | null>(null);
++  const [result, setResult] = useState<ResearchResult | null>(null);
++  const [error, setError] = useState<string | null>(null);
++  const [activeStep, setActiveStep] = useState(0);
++
++  const stepTimer = useRef<ReturnType<typeof setInterval> | undefined>(undefined);
++  const imageUrlRef = useRef<string>("");
++
++  const [recent, setRecent] = useState<ProductIdea[]>([]);
++  const loadRecent = useCallback(() => {
++    fetch("/api/ideas")
++      .then((r) => r.json())
++      .then((d) => setRecent(Array.isArray(d?.ideas) ? d.ideas : []))
++      .catch(() => {});
++  }, []);
++  useEffect(() => {
++    loadRecent();
++  }, [loadRecent]);
++
++  function startStepAnimation() {
++    setActiveStep(0);
++    clearInterval(stepTimer.current);
++    stepTimer.current = setInterval(() => {
++      setActiveStep((s) => Math.min(s + 1, PIPELINE.length - 1));
++    }, 3000);
++  }
++
++  async function submit(payload: Record<string, string>) {
++    setError(null);
++    setStage("running");
++    startStepAnimation();
++    try {
++      const createRes = await fetch("/api/ideas", {
++        method: "POST",
++        headers: { "Content-Type": "application/json" },
++        body: JSON.stringify(payload),
++      });
++      const created = await createRes.json();
++      if (!createRes.ok) throw new Error(created?.error || "Could not submit the idea.");
++      const newIdea: ProductIdea = created.idea;
++      setIdea(newIdea);
++
++      const res = await fetch(`/api/ideas/${newIdea.id}/research`, { method: "POST" });
++      const data = await res.json();
++      if (!res.ok && !data?.idea) throw new Error(data?.error || "Research failed.");
++      const research: ResearchResult | undefined = data?.idea?.research;
++      clearInterval(stepTimer.current);
++      if (!research || research.error) {
++        setError(research?.error || "Research did not complete.");
++        setStage("error");
++        return;
++      }
++      setResult(research);
++      setStage("results");
++      loadRecent();
++    } catch (err) {
++      clearInterval(stepTimer.current);
++      setError(err instanceof Error ? err.message : "Something went wrong.");
++      setStage("error");
++    }
++  }
++
++  function reset() {
++    setStage("form");
++    setIdea(null);
++    setResult(null);
++    setError(null);
++    imageUrlRef.current = "";
++  }
++
++  function viewIdea(i: ProductIdea) {
++    if (!i.research) return;
++    setIdea(i);
++    setResult(i.research);
++    setStage("results");
++  }
++
++  return (
++    <div className="content">
++      <header className="page-head">
++        <div>
++          <h1 className="page-title">Validate a product idea</h1>
++          <p className="page-sub">
++            Submit a product concept and a panel of AI agents benchmark it against the live market —{" "}
++            <b>classification, store &amp; competitor benchmark, China + web suppliers, and a strategy
++            analysis</b> with positioning, pricing and next steps.
++          </p>
++        </div>
++        {stage !== "form" && (
++          <button className="btn secondary sm" onClick={reset}>
++            <Icons.plus size={14} />
++            New idea
++          </button>
++        )}
++      </header>
++
++      {stage === "form" && (
++        <>
++          <SubmitForm imageUrlRef={imageUrlRef} onSubmit={submit} />
++          <RecentIdeas ideas={recent} onView={viewIdea} />
++        </>
++      )}
++
++      {stage === "running" && idea && <RunningView idea={idea} activeStep={activeStep} />}
++
++      {stage === "error" && (
++        <div className="callout warn">
++          <Icons.alert size={15} />
++          <p>{error || "Research failed to complete. Please try again."}</p>
++        </div>
++      )}
++
++      {(stage === "results" || (stage === "error" && result)) && result && idea && (
++        <Results idea={idea} result={result} />
++      )}
++    </div>
++  );
++}
++
++/* ------------------------------ Recently validated ------------------------------ */
++
++const STATUS_BADGE: Record<ProductIdea["status"], { cls: string; label: string }> = {
++  queued: { cls: "", label: "queued" },
++  researching: { cls: "med", label: "researching" },
++  complete: { cls: "low", label: "complete" },
++  error: { cls: "high", label: "error" },
++};
++
++function RecentIdeas({ ideas, onView }: { ideas: ProductIdea[]; onView: (i: ProductIdea) => void }) {
++  if (!ideas.length) return null;
++  return (
++    <section className="panel idea-recent">
++      <p className="panel-h">
++        <Icons.grid size={13} /> Recently validated
++        <span className="panel-meta">{ideas.length}</span>
++      </p>
++      <ul className="idea-recent-list">
++        {ideas.map((i) => {
++          const s = STATUS_BADGE[i.status] ?? STATUS_BADGE.queued;
++          return (
++            <li key={i.id} className="idea-recent-row">
++              <div className="idea-recent-main">
++                <span className="idea-recent-title">{i.title}</span>
++                {i.category ? <span className="cat-chip">{i.category}</span> : null}
++              </div>
++              <div className="idea-recent-meta">
++                <span className={cc("badge", s.cls)}>
++                  {(i.status === "complete" || i.status === "researching") && <span className="dot" />}
++                  {s.label}
++                </span>
++                {i.research ? (
++                  <button className="link-btn" onClick={() => onView(i)}>
++                    View <Icons.arrowRight size={12} />
++                  </button>
++                ) : null}
++              </div>
++            </li>
++          );
++        })}
++      </ul>
++    </section>
++  );
++}
++
++/* ------------------------------ Submit form ------------------------------ */
++
++function Field({
++  label,
++  required,
++  hint,
++  children,
++}: {
++  label: string;
++  required?: boolean;
++  hint?: string;
++  children: React.ReactNode;
++}) {
++  return (
++    <label className="field">
++      <span className="field-label">
++        {label}
++        {required && <span className="field-req"> *</span>}
++      </span>
++      {hint && <span className="field-hint">{hint}</span>}
++      <div className="field-control">{children}</div>
++    </label>
++  );
++}
++
++function SubmitForm({
++  imageUrlRef,
++  onSubmit,
++}: {
++  imageUrlRef: React.MutableRefObject<string>;
++  onSubmit: (payload: Record<string, string>) => void;
++}) {
++  const fileRef = useRef<HTMLInputElement>(null);
++  const [imageUrl, setImageUrl] = useState("");
++  const [imagePreview, setImagePreview] = useState("");
++  const [formError, setFormError] = useState<string | null>(null);
++
++  function setImg(v: string) {
++    setImageUrl(v);
++    setImagePreview(v);
++    imageUrlRef.current = v;
++  }
++
++  function handleFile(file?: File) {
++    setFormError(null);
++    if (!file) return;
++    if (!file.type.startsWith("image/")) {
++      setFormError("Please choose an image file.");
++      return;
++    }
++    if (file.size > MAX_IMAGE_BYTES) {
++      setFormError("Image is too large (max 1.5 MB). Try a smaller file or paste an image URL.");
++      return;
++    }
++    const reader = new FileReader();
++    reader.onload = () => setImg(String(reader.result || ""));
++    reader.readAsDataURL(file);
++  }
++
++  function handleSubmit(e: React.FormEvent<HTMLFormElement>) {
++    e.preventDefault();
++    setFormError(null);
++    const form = new FormData(e.currentTarget);
++    const payload: Record<string, string> = {
++      title: String(form.get("title") || ""),
++      description: String(form.get("description") || ""),
++      category: String(form.get("category") || ""),
++      targetMarket: String(form.get("targetMarket") || ""),
++      audience: String(form.get("audience") || ""),
++      priceTarget: String(form.get("priceTarget") || ""),
++      features: String(form.get("features") || ""),
++      submittedBy: String(form.get("submittedBy") || ""),
++      imageUrl: imageUrlRef.current,
++    };
++    if (!payload.title.trim()) {
++      setFormError("Please give your product idea a title.");
++      return;
++    }
++    onSubmit(payload);
++  }
++
++  return (
++    <div className="ideas-form-grid">
++      <form className="panel idea-form" onSubmit={handleSubmit}>
++        <Field label="Product idea title" required hint="A short, descriptive name.">
++          <input
++            name="title"
++            required
++            placeholder="e.g. Insulated stainless steel kids' water bottle"
++            className="nxb-input"
++          />
++        </Field>
++
++        <Field label="Describe the idea" required hint="What is it, what problem does it solve, what makes it different?">
++          <textarea
++            name="description"
++            required
++            rows={4}
++            placeholder="Describe the product, its purpose and any standout features…"
++            className="nxb-input"
++          />
++        </Field>
++
++        <div className="field-row">
++          <Field label="Category">
++            <input name="category" list="ideas-category-options" placeholder="Choose or type a category" className="nxb-input" />
++            <datalist id="ideas-category-options">
++              {CATEGORIES.map((c) => (
++                <option key={c} value={c} />
++              ))}
++            </datalist>
++          </Field>
++          <Field label="Target price" hint="Used to position against the market.">
++            <input name="priceTarget" placeholder="e.g. $30–45" className="nxb-input" />
++          </Field>
++        </div>
++
++        <div className="field-row">
++          <Field label="Target market">
++            <input name="targetMarket" placeholder="e.g. Australia, UK" className="nxb-input" />
++          </Field>
++          <Field label="Target audience">
++            <input name="audience" placeholder="e.g. Parents of toddlers" className="nxb-input" />
++          </Field>
++        </div>
++
++        <Field label="Key features" hint="One per line or comma-separated — helps agents benchmark.">
++          <textarea name="features" rows={3} placeholder={"Leak-proof lid\nBPA-free\nHolds 500ml"} className="nxb-input" />
++        </Field>
++
++        <Field label="Reference image" hint="Optional — upload a sketch/photo or paste an image URL.">
++          <div
++            className="dropzone"
++            onDragOver={(e) => e.preventDefault()}
++            onDrop={(e) => {
++              e.preventDefault();
++              handleFile(e.dataTransfer.files?.[0]);
++            }}
++          >
++            {imagePreview ? (
++              <div className="dropzone-preview">
++                {/* eslint-disable-next-line @next/next/no-img-element */}
++                <img src={imagePreview} alt="Preview" className="dropzone-thumb" />
++                <button
++                  type="button"
++                  className="link-btn"
++                  onClick={() => {
++                    setImg("");
++                    if (fileRef.current) fileRef.current.value = "";
++                  }}
++                >
++                  <Icons.x size={14} /> Remove
++                </button>
++              </div>
++            ) : (
++              <button type="button" className="dropzone-btn" onClick={() => fileRef.current?.click()}>
++                <Icons.box size={20} />
++                <span className="dropzone-main">Click to upload or drag &amp; drop</span>
++                <span className="dropzone-sub">PNG/JPG up to 1.5 MB</span>
++              </button>
++            )}
++            <input
++              ref={fileRef}
++              type="file"
++              accept="image/*"
++              className="hidden-input"
++              onChange={(e) => handleFile(e.target.files?.[0])}
++            />
++            <input
++              className="nxb-input dropzone-url"
++              value={imageUrl.startsWith("data:") ? "" : imageUrl}
++              onChange={(e) => setImg(e.target.value)}
++              placeholder="…or paste an image URL"
++            />
++          </div>
++        </Field>
++
++        <Field label="Your name / team" hint="Optional.">
++          <input name="submittedBy" placeholder="e.g. Priya, Product team" className="nxb-input" />
++        </Field>
++
++        {formError && (
++          <div className="callout warn">
++            <Icons.alert size={15} />
++            <p>{formError}</p>
++          </div>
++        )}
++
++        <div className="idea-form-foot">
++          <button type="submit" className="btn primary">
++            <Icons.spark size={15} />
++            Submit &amp; run agents
++          </button>
++          <span className="idea-form-note">Agents start researching as soon as you submit.</span>
++        </div>
++      </form>
++
++      <aside className="panel idea-aside">
++        <p className="panel-h">
++          <Icons.spark size={13} /> What happens next
++        </p>
++        <p className="idea-aside-lead">As soon as you submit, the research agents start working:</p>
++        <ul className="agent-steps">
++          {PIPELINE.map((a) => {
++            const Icon = Icons[a.icon];
++            return (
++              <li key={a.id} className="agent-step">
++                <span className="agent-step-icon">
++                  <Icon size={15} />
++                </span>
++                <div>
++                  <p className="agent-step-name">{a.name}</p>
++                  <p className="agent-step-desc">{a.desc}</p>
++                </div>
++              </li>
++            );
++          })}
++        </ul>
++      </aside>
++    </div>
++  );
++}
++
++/* ------------------------------ Running view ------------------------------ */
++
++function RunningView({ idea, activeStep }: { idea: ProductIdea; activeStep: number }) {
++  return (
++    <>
++      <div className="panel idea-banner">
++        <span className="idea-banner-icon">
++          <Icons.spark size={18} />
++        </span>
++        <div>
++          <p className="idea-banner-title">Researching “{idea.title}”</p>
++          <p className="idea-banner-sub">AI agents are seeking market info and benchmarking similar products…</p>
++        </div>
++      </div>
++      <div className="pipeline-grid">
++        {PIPELINE.map((step, i) => {
++          const state = i < activeStep ? "done" : i === activeStep ? "active" : "pending";
++          const Icon = Icons[step.icon];
++          return (
++            <div key={step.id} className={cc("pipeline-card", state)}>
++              <div className="pipeline-card-top">
++                <span className="pipeline-card-icon">
++                  <Icon size={15} />
++                </span>
++                {state === "done" ? (
++                  <Icons.check size={16} />
++                ) : state === "active" ? (
++                  <span className="spinner" aria-hidden />
++                ) : (
++                  <span className="pipeline-dot" aria-hidden />
++                )}
++              </div>
++              <p className="pipeline-card-name">{step.name}</p>
++              <p className="pipeline-card-desc">{step.desc}</p>
++            </div>
++          );
++        })}
++      </div>
++    </>
++  );
++}
++
++/* ------------------------------ Results ------------------------------ */
++
++function Results({ idea, result }: { idea: ProductIdea; result: ResearchResult }) {
++  const pr = result.benchmark.priceRange;
++  const fmt = (n: number) => `${pr?.currency === "USD" ? "$" : (pr?.currency || "$") + " "}${Math.round(n)}`;
++  const a = result.analysis;
++
++  return (
++    <div className="ideas-results">
++      <div className="stat-row">
++        <StatTile value={result.benchmark.competitors.length} label="Products benchmarked" sub="across stores & web" />
++        <StatTile value={result.suppliers?.length ?? 0} label="Suppliers found" sub="China + web sourcing" />
++        <StatTile
++          value={pr ? fmt(pr.avg) : "—"}
++          label="Avg market price"
++          sub={pr ? `${fmt(pr.min)} – ${fmt(pr.max)}` : "no pricing extracted"}
++          accent
++        />
++        <StatTile
++          value={result.mode === "live" ? "Live" : "Demo"}
++          label="Research mode"
++          sub={result.mode === "live" ? `${(result.durationMs / 1000).toFixed(1)}s` : "set API keys for live data"}
++        />
++      </div>
++
++      {result.mode === "demo" && (
++        <div className="callout warn">
++          <Icons.alert size={15} />
++          <p>
++            <b>Demo data.</b> Set <code>FIRECRAWL_API_KEY</code>, <code>APIFY_API_TOKEN</code> and{" "}
++            <code>ANTHROPIC_API_KEY</code> to let the agents research live products.
++          </p>
++        </div>
++      )}
++
++      {/* Strategy analysis */}
++      {a && (
++        <section className="panel">
++          <p className="panel-h">
++            <Icons.spark size={13} /> AI strategy analysis
++            <span className="panel-meta">Strategy Analyst agent</span>
++          </p>
++          <p className="analysis-summary">{a.summary}</p>
++          <div className="analysis-grid">
++            <AnalysisBlock icon="globe" title="Positioning">
++              <p className="analysis-text">{a.positioning}</p>
++            </AnalysisBlock>
++            <AnalysisBlock icon="trending" title="Suggested price">
++              <p className="analysis-price">{a.suggestedPrice}</p>
++            </AnalysisBlock>
++            <AnalysisBlock icon="spark" title="Differentiation">
++              <AnalysisList items={a.differentiation} tone="low" />
++            </AnalysisBlock>
++            <AnalysisBlock icon="alert" title="Risks to watch">
++              <AnalysisList items={a.risks} tone="med" />
++            </AnalysisBlock>
++          </div>
++          {a.nextSteps.length > 0 && (
++            <AnalysisBlock icon="check" title="Recommended next steps">
++              <ol className="next-steps">
++                {a.nextSteps.map((s, i) => (
++                  <li key={i}>
++                    <span className="next-step-num">{i + 1}</span>
++                    <span>{s}</span>
++                  </li>
++                ))}
++              </ol>
++            </AnalysisBlock>
++          )}
++        </section>
++      )}
++
++      {/* Agent activity */}
++      <section>
++        <p className="panel-h section-h">
++          <Icons.pulse size={13} /> Agent activity
++        </p>
++        <div className="agent-activity-grid">
++          {result.agents.map((ag) => (
++            <div key={ag.id} className="panel agent-activity">
++              <div className="agent-activity-top">
++                <p className="agent-activity-name">{ag.name}</p>
++                {ag.status === "complete" ? (
++                  <span className="badge low">
++                    <span className="dot" /> done
++                  </span>
++                ) : ag.status === "skipped" ? (
++                  <span className="badge">skipped</span>
++                ) : (
++                  <span className="badge high">
++                    <span className="dot" /> error
++                  </span>
++                )}
++              </div>
++              <p className="agent-activity-detail">{ag.detail}</p>
++            </div>
++          ))}
++        </div>
++      </section>
++
++      {/* Enriched understanding */}
++      <section className="panel">
++        <p className="panel-h">
++          <Icons.box size={13} /> Enriched understanding
++        </p>
++        <p className="analysis-text">{result.enrichment.summary}</p>
++        <div className="enrich-grid">
++          <InfoRow icon="box" label="Suggested category" value={result.enrichment.suggestedCategory} />
++          <InfoRow icon="grid" label="Target audience" value={result.enrichment.targetAudience} />
++          {result.classification?.productClass && (
++            <InfoRow icon="search" label="Product class" value={result.classification.productClass} />
++          )}
++        </div>
++        {result.enrichment.tags.length > 0 && (
++          <div className="enrich-tags">
++            {result.enrichment.tags.map((t) => (
++              <span key={t} className="cat-chip">
++                #{t}
++              </span>
++            ))}
++          </div>
++        )}
++      </section>
++
++      {/* Benchmark */}
++      <section>
++        <p className="panel-h section-h">
++          <Icons.trending size={13} /> Market benchmark
++        </p>
++        <BenchmarkTable competitors={result.benchmark.competitors} />
++      </section>
++
++      {/* Makers */}
++      {result.makers?.length ? (
++        <section>
++          <p className="panel-h section-h">
++            <Icons.building size={13} /> Who&apos;s making it
++          </p>
++          <div className="maker-grid">
++            {result.makers.map((m) => (
++              <div key={m.name} className="panel maker-card">
++                <div className="maker-id">
++                  <p className="maker-name">{m.name}</p>
++                  <p className="maker-offers">
++                    {m.offers} listing{m.offers === 1 ? "" : "s"}
++                  </p>
++                </div>
++                {m.lowestPrice && <span className="maker-price">from {m.lowestPrice}</span>}
++              </div>
++            ))}
++          </div>
++        </section>
++      ) : null}
++
++      {/* Suppliers */}
++      {result.suppliers?.length ? (
++        <section>
++          <p className="panel-h section-h">
++            <Icons.factory size={13} /> Suppliers &amp; manufacturers
++          </p>
++          <div className="supplier-grid">
++            {result.suppliers.map((s, i) => (
++              <a key={i} href={s.url} target="_blank" rel="noopener noreferrer" className="panel supplier-card">
++                <div className="supplier-top">
++                  <span className="supplier-name">
++                    {s.name}
++                    <Icons.arrowUpRight size={13} />
++                  </span>
++                  {s.source === "aliexpress" && <span className="badge med">AliExpress</span>}
++                </div>
++                {(s.price || s.orders != null || s.rating != null) && (
++                  <div className="supplier-meta">
++                    {s.price && <span className="supplier-price">{s.price}</span>}
++                    {s.rating != null && <span>★ {s.rating}</span>}
++                    {s.orders != null && <span>{s.orders.toLocaleString()} orders</span>}
++                  </div>
++                )}
++                {s.snippet && <p className="supplier-snippet">{s.snippet}</p>}
++              </a>
++            ))}
++          </div>
++        </section>
++      ) : null}
++
++      {/* Insights */}
++      {result.benchmark.insights.length > 0 && (
++        <section className="panel em-panel">
++          <p className="panel-h">
++            <Icons.spark size={13} /> Insights
++          </p>
++          <ul className="dp-why">
++            {result.benchmark.insights.map((ins, i) => (
++              <li key={i}>
++                <Icons.check size={14} />
++                {ins}
++              </li>
++            ))}
++          </ul>
++        </section>
++      )}
++
++      {/* Sources */}
++      {result.sources.length > 0 && (
++        <section>
++          <p className="panel-h section-h">
++            <Icons.search size={13} /> Sources
++          </p>
++          <ul className="source-list">
++            {result.sources.map((s, i) => (
++              <li key={i}>
++                <a href={s.url} target="_blank" rel="noopener noreferrer" className="link-btn">
++                  <Icons.arrowUpRight size={13} />
++                  {s.title}
++                </a>
++              </li>
++            ))}
++          </ul>
++        </section>
++      )}
++
++      <p className="idea-foot-note">
++        Submitted {new Date(idea.createdAt).toLocaleDateString()}
++        {idea.submittedBy ? ` · ${idea.submittedBy}` : ""} · research ran{" "}
++        {new Date(result.ranAt).toLocaleString()}
++      </p>
++    </div>
++  );
++}
++
++function BenchmarkTable({ competitors }: { competitors: ResearchResult["benchmark"]["competitors"] }) {
++  if (!competitors.length) {
++    return <div className="empty">No comparable products were found.</div>;
++  }
++  return (
++    <div className="tablewrap">
++      <table className="dtable">
++        <thead>
++          <tr>
++            <th>Product</th>
++            <th>Brand / source</th>
++            <th>Price</th>
++            <th>Rating</th>
++            <th>Key features</th>
++            <th />
++          </tr>
++        </thead>
++        <tbody>
++          {competitors.map((c, i) => (
++            <tr key={(c.url || c.name) + i} className="no-cursor">
++              <td className="td-cat">{c.name}</td>
++              <td>
++                <div>{c.brand || "—"}</div>
++                <div className="td-source">{c.source}</div>
++              </td>
++              <td className="mono">{c.price || "—"}</td>
++              <td className="mono">
++                {c.rating != null ? (
++                  <>
++                    ★ {c.rating}
++                    {c.reviews != null && <span className="td-source"> ({c.reviews.toLocaleString()})</span>}
++                  </>
++                ) : (
++                  "—"
++                )}
++              </td>
++              <td>
++                {c.features.length ? (
++                  <div className="feat-chips">
++                    {c.features.map((f, j) => (
++                      <span key={j} className="feat-chip">
++                        {f}
++                      </span>
++                    ))}
++                  </div>
++                ) : (
++                  "—"
++                )}
++              </td>
++              <td className="r">
++                {c.url ? (
++                  <a href={c.url} target="_blank" rel="noopener noreferrer" className="link-btn">
++                    View <Icons.arrowUpRight size={12} />
++                  </a>
++                ) : null}
++              </td>
++            </tr>
++          ))}
++        </tbody>
++      </table>
++    </div>
++  );
++}
++
++function AnalysisBlock({
++  icon,
++  title,
++  children,
++}: {
++  icon: keyof typeof Icons;
++  title: string;
++  children: React.ReactNode;
++}) {
++  const Icon = Icons[icon];
++  return (
++    <div className="analysis-block">
++      <p className="analysis-block-h">
++        <Icon size={13} />
++        {title}
++      </p>
++      {children}
++    </div>
++  );
++}
++
++function AnalysisList({ items, tone }: { items: string[]; tone: "low" | "med" }) {
++  if (!items.length) return <p className="analysis-text muted">—</p>;
++  return (
++    <ul className="analysis-list">
++      {items.map((item, i) => (
++        <li key={i}>
++          <span className={cc("analysis-dot", tone)} />
++          {item}
++        </li>
++      ))}
++    </ul>
++  );
++}
++
++function InfoRow({ icon, label, value }: { icon: keyof typeof Icons; label: string; value: string }) {
++  const Icon = Icons[icon];
++  return (
++    <div className="info-row">
++      <span className="info-row-icon">
++        <Icon size={15} />
++      </span>
++      <div>
++        <p className="info-row-label">{label}</p>
++        <p className="info-row-value">{value}</p>
++      </div>
++    </div>
++  );
++}
+diff --git a/web/components/views/insights.tsx b/web/components/views/insights.tsx
+index c7e7d99..2d308fc 100644
+--- a/web/components/views/insights.tsx
++++ b/web/components/views/insights.tsx
+@@ -1,6 +1,8 @@
+ "use client";
+ 
++import { useEffect, useState } from "react";
+ import type { Insight, InsightAction } from "@/lib/types";
++import type { ProductIdea, ResearchResult } from "@/lib/ideas/types";
+ import { cc } from "@/lib/util";
+ import { Icons } from "../icons";
+ import { useModel } from "../model-context";
+@@ -66,14 +68,75 @@ function InsightCard({ insight: i }: { insight: Insight }) {
+             {competitors[0].competitor} sources {competitors[0].origin}
+           </span>
+         )}
+-        <span className="ins-narrator">{i.narrator === "llm" ? "Claude" : "rule-based"}</span>
++        <span className="ins-narrator">
++          {i.narrator === "supplyscope" ? "Validate" : i.narrator === "llm" ? "Claude" : "rule-based"}
++        </span>
+       </div>
+     </article>
+   );
+ }
+ 
++// Parse a leading number out of a price string (e.g. "$0.99", "US $12.50").
++function priceToNum(p?: string | null): number | null {
++  if (!p) return null;
++  const m = String(p).replace(/[, ]/g, "").match(/(\d+(?:\.\d+)?)/);
++  return m ? parseFloat(m[1]) : null;
++}
++
++// Map a completed "Validate" idea into the dashboard's Insight shape so it
++// renders alongside the pipeline's procurement recommendations. Score is the
++// retail-vs-cheapest-supplier margin on RSI's 0..100 scale.
++function validatedToInsight(idea: ProductIdea, i: number): Insight {
++  const r = idea.research as ResearchResult;
++  const pr = r?.benchmark?.priceRange;
++  const lows = (r?.suppliers ?? [])
++    .map((s) => priceToNum(s.price))
++    .filter((v): v is number => v != null && v > 0);
++  const score =
++    pr && pr.avg > 0 && lows.length
++      ? Math.max(0, Math.min(100, Math.round((1 - Math.min(...lows) / pr.avg) * 100)))
++      : 60;
++  const action: InsightAction = score >= 70 ? "PROCURE" : score >= 45 ? "WATCH" : "HOLD";
++  const compCount = r?.benchmark?.competitors?.length ?? 0;
++  const lead = r?.analysis?.positioning || r?.benchmark?.insights?.[0] || "Market scan complete.";
++  return {
++    id: -(i + 1), // negative ids never collide with snapshot insights
++    category: idea.category || r?.classification?.category || "Product idea",
++    market: idea.targetMarket || "Validated idea",
++    action,
++    score,
++    confidence: Math.min(0.95, 0.45 + compCount * 0.05),
++    headline: idea.title,
++    narrative: `${idea.title} — ${lead}`,
++    narrator: "supplyscope",
++    evidence: {},
++  };
++}
++
+ export function Insights() {
+-  const { insights, procureCount } = useModel();
++  const { insights: base, procureCount: basePC } = useModel();
++  const [validated, setValidated] = useState<Insight[]>([]);
++
++  // Pull completed "Validate" ideas (live Supabase or the in-memory store) and
++  // surface them as procurement insights. Client-side so it stays fresh without
++  // a rebuild of the prerendered dashboard.
++  useEffect(() => {
++    let live = true;
++    fetch("/api/ideas")
++      .then((r) => r.json())
++      .then((d) => {
++        if (!live) return;
++        const ideas: ProductIdea[] = Array.isArray(d?.ideas) ? d.ideas : [];
++        setValidated(ideas.filter((x) => x.status === "complete" && x.research).map(validatedToInsight));
++      })
++      .catch(() => {});
++    return () => {
++      live = false;
++    };
++  }, []);
++
++  const insights = [...validated, ...base];
++  const procureCount = basePC + validated.filter((i) => i.action === "PROCURE").length;
+   const watch = insights.filter((i) => i.action === "WATCH").length;
+ 
+   return (
+@@ -84,7 +147,7 @@ export function Insights() {
+           <p className="page-sub">
+             Ranked recommendations for the buying team — <b>what to procure and from which origin</b>
+             , fused from demand momentum (search + social), marketplace and supply-side activity, and
+-            trade origins. Each is scored and confidence-rated by how many signals corroborate.
++            trade origins. Submitted product ideas from <b>Validate</b> appear here too.
+           </p>
+         </div>
+       </header>
+@@ -94,9 +157,9 @@ export function Insights() {
+         <StatTile value={procureCount} label="Procure now" sub="strong multi-signal demand" accent />
+         <StatTile value={watch} label="Watch" sub="early / accelerating" />
+         <StatTile
+-          value={insights[0]?.narrator === "llm" ? "Claude" : "Rule"}
+-          label="Narratives"
+-          sub={insights[0]?.narrator === "llm" ? "AI-written" : "deterministic"}
++          value={validated.length}
++          label="From Validate"
++          sub={validated.length ? "submitted product ideas" : "submit ideas in Validate"}
+         />
+       </div>
+ 
+diff --git a/web/lib/ideas/agents.ts b/web/lib/ideas/agents.ts
+new file mode 100644
+index 0000000..5bfd331
+--- /dev/null
++++ b/web/lib/ideas/agents.ts
+@@ -0,0 +1,322 @@
++import "server-only";
++
++import type {
++  AgentRunInfo,
++  Classification,
++  Competitor,
++  Maker,
++  ProductIdea,
++  ResearchResult,
++  Supplier,
++} from "./types";
++import { extractProduct, firecrawlEnabled, search, type SearchResult } from "./firecrawl";
++import { amazonSearch, aliexpressSuppliers, apifyEnabled } from "./apify";
++import { analyzeWithClaude, classifyProduct, llmEnabled } from "./llm";
++import { parsePrice, priceRangeOf } from "./price";
++
++const STOPWORDS = new Set([
++  "the", "a", "an", "and", "or", "for", "with", "without", "of", "to", "in",
++  "on", "by", "your", "our", "that", "this", "is", "are", "be", "new", "made",
++  "from", "into", "product", "products", "design", "designed", "high", "best",
++]);
++
++function domainOf(url: string): string {
++  try {
++    return new URL(url).hostname.replace(/^www\./, "");
++  } catch {
++    return url;
++  }
++}
++
++function keywords(...parts: string[]): string[] {
++  const seen = new Set<string>();
++  const out: string[] = [];
++  for (const p of parts.join(" ").toLowerCase().match(/[a-z0-9]+/g) ?? []) {
++    if (p.length < 3 || STOPWORDS.has(p) || seen.has(p)) continue;
++    seen.add(p);
++    out.push(p);
++    if (out.length >= 8) break;
++  }
++  return out;
++}
++
++function uniqueByDomain(results: SearchResult[], max: number): SearchResult[] {
++  const seen = new Set<string>();
++  const out: SearchResult[] = [];
++  for (const r of results) {
++    const d = domainOf(r.url);
++    if (seen.has(d)) continue;
++    seen.add(d);
++    out.push(r);
++    if (out.length >= max) break;
++  }
++  return out;
++}
++
++function buildMakers(competitors: Competitor[]): Maker[] {
++  const map = new Map<string, { name: string; low: number | null; currency: string; count: number }>();
++  competitors.forEach((c) => {
++    if (!c.brand || c.brand.includes(".") || c.brand.length < 2) return;
++    const key = c.brand.toLowerCase();
++    const e = map.get(key) ?? { name: c.brand, low: null, currency: c.currency || "", count: 0 };
++    e.count += 1;
++    if (c.priceValue != null && (e.low == null || c.priceValue < e.low)) {
++      e.low = c.priceValue;
++      e.currency = c.currency || e.currency;
++    }
++    map.set(key, e);
++  });
++  return Array.from(map.values())
++    .sort((a, b) => b.count - a.count)
++    .slice(0, 9)
++    .map((m) => ({
++      name: m.name,
++      offers: m.count,
++      lowestPrice: m.low != null ? `${m.currency === "USD" || !m.currency ? "$" : m.currency + " "}${Math.round(m.low)}` : "",
++    }));
++}
++
++function buildInsights(
++  idea: ProductIdea,
++  competitors: Competitor[],
++  suppliers: Supplier[],
++  priceRange: ResearchResult["benchmark"]["priceRange"]
++): string[] {
++  const insights: string[] = [];
++  if (competitors.length) insights.push(`Benchmarked ${competitors.length} comparable products across online stores and the web.`);
++  if (priceRange) {
++    const fmt = (n: number) => `${priceRange.currency === "USD" ? "$" : (priceRange.currency || "$") + " "}${Math.round(n)}`;
++    insights.push(`Retail pricing ranges from ${fmt(priceRange.min)} to ${fmt(priceRange.max)} (avg ~${fmt(priceRange.avg)}).`);
++    const target = parsePrice(idea.priceTarget).value;
++    if (target != null) {
++      if (target < priceRange.min) insights.push(`Your ${fmt(target)} target undercuts every product found — a potential value play.`);
++      else if (target > priceRange.max) insights.push(`Your ${fmt(target)} target sits above the market — lean into premium positioning.`);
++      else insights.push(`Your ${fmt(target)} target lands mid-market — differentiation on features will matter.`);
++    }
++  }
++  const ali = suppliers.filter((s) => s.source === "aliexpress" && s.price);
++  if (ali.length) {
++    const lows = ali.map((s) => parsePrice(s.price).value).filter((v): v is number => v != null);
++    if (lows.length) insights.push(`China suppliers list from ~$${Math.round(Math.min(...lows))}, suggesting healthy gross margin at retail prices.`);
++  }
++  if (insights.length < 2) insights.push("Use the benchmark below to position pricing, features and messaging before committing to development.");
++  return insights;
++}
++
++function buildEnrichment(idea: ProductIdea, competitors: Competitor[], classification: Classification | null) {
++  const tags = classification?.keywords?.length ? classification.keywords.slice(0, 8) : keywords(idea.title, idea.features, idea.category);
++  const baseSummary = classification?.summary ? classification.summary : (idea.description ? idea.description.slice(0, 160) : "No description provided.");
++  return {
++    suggestedCategory: classification?.category || idea.category || "Uncategorised",
++    tags,
++    targetAudience: idea.audience || idea.targetMarket || "General consumers",
++    summary: `${baseSummary} Benchmarked against ${competitors.length} product${competitors.length === 1 ? "" : "s"}.`,
++  };
++}
++
++async function benchmarkViaFirecrawl(query: string): Promise<{ competitors: Competitor[]; sources: { title: string; url: string }[]; found: number }> {
++  const results = await search(query, 8);
++  const candidates = uniqueByDomain(results, 4).slice(0, 3);
++  const extractions = await Promise.allSettled(candidates.map((c) => extractProduct(c.url)));
++
++  const competitors: Competitor[] = candidates.map((cand, i) => {
++    const res = extractions[i];
++    const data = res.status === "fulfilled" ? res.value : null;
++    const priced = parsePrice(data?.price);
++    return {
++      name: data?.productName?.trim() || cand.title.replace(/\s*[-|–].*$/, "").trim(),
++      brand: data?.brand?.trim() || domainOf(cand.url),
++      price: data?.price?.trim() || "",
++      priceValue: priced.value,
++      currency: priced.currency,
++      features: (data?.keyFeatures ?? []).slice(0, 5).map((f) => String(f).trim()).filter(Boolean),
++      url: cand.url,
++      source: domainOf(cand.url),
++      rating: null,
++      reviews: null,
++    };
++  });
++
++  return {
++    competitors,
++    sources: results.slice(0, 8).map((r) => ({ title: r.title, url: r.url })),
++    found: results.length,
++  };
++}
++
++async function findWebSuppliers(productClass: string): Promise<Supplier[]> {
++  const results = await search(`${productClass} manufacturer supplier wholesale OEM`, 6);
++  return uniqueByDomain(results, 5)
++    .slice(0, 5)
++    .map((r) => ({ name: r.title.replace(/\s*[-|–].*$/, "").trim(), url: r.url, snippet: r.description, source: "web" }));
++}
++
++function dedupeCompetitors(rows: Competitor[]): Competitor[] {
++  const seen = new Set<string>();
++  return rows.filter((c) => {
++    const key = c.name.toLowerCase().slice(0, 40);
++    if (!key || seen.has(key)) return false;
++    seen.add(key);
++    return true;
++  });
++}
++
++function dedupeSuppliers(rows: Supplier[]): Supplier[] {
++  const seen = new Set<string>();
++  return rows.filter((s) => {
++    const key = (s.url || s.name).toLowerCase();
++    if (!key || seen.has(key)) return false;
++    seen.add(key);
++    return true;
++  });
++}
++
++function runDemo(idea: ProductIdea, started: number): ResearchResult {
++  const base = 25 + (idea.title.length % 7) * 6;
++  const competitors: Competitor[] = [
++    { name: `${idea.category || "Market"} Leader Pro`, brand: "Northwind", price: `$${base + 20}`, priceValue: base + 20, currency: "USD", features: ["Premium materials", "2-year warranty"], url: "https://example.com/a", source: "example.com", rating: 4.6, reviews: 1200 },
++    { name: `Everyday ${idea.category || "Product"}`, brand: "Brightway", price: `$${base}`, priceValue: base, currency: "USD", features: ["Affordable", "Lightweight"], url: "https://example.com/b", source: "example.com", rating: 4.2, reviews: 430 },
++    { name: `${idea.title} Alternative`, brand: "Marisol", price: `$${base + 10}`, priceValue: base + 10, currency: "USD", features: ["Compact"], url: "https://example.com/c", source: "example.com", rating: 4.4, reviews: 90 },
++  ];
++  const priceRange = priceRangeOf(competitors);
++  return {
++    mode: "demo",
++    ranAt: new Date().toISOString(),
++    durationMs: Date.now() - started,
++    enrichment: buildEnrichment(idea, competitors, null),
++    benchmark: { competitors, priceRange, insights: buildInsights(idea, competitors, [], priceRange) },
++    makers: buildMakers(competitors),
++    suppliers: [],
++    agents: [
++      { id: "amazon", name: "Online Stores", description: "Scans Amazon for live listings.", status: "skipped", detail: "Demo mode — set APIFY_API_TOKEN for live store data." },
++      { id: "benchmark", name: "Benchmarking", description: "Builds the competitor benchmark.", status: "complete", detail: "Generated sample benchmark data." },
++    ],
++    sources: [],
++  };
++}
++
++export async function runResearch(idea: ProductIdea): Promise<ResearchResult> {
++  const started = Date.now();
++
++  if (!firecrawlEnabled() && !apifyEnabled() && !llmEnabled()) {
++    return runDemo(idea, started);
++  }
++
++  const agents: AgentRunInfo[] = [];
++
++  // 1. Classify (Claude, vision-aware) — drives search terms.
++  let classification: Classification | null = null;
++  if (llmEnabled()) {
++    classification = await classifyProduct(idea);
++    agents.push({
++      id: "classifier",
++      name: "Classifier",
++      description: "Classifies the product and derives search terms.",
++      status: classification ? "complete" : "error",
++      detail: classification ? `Class: ${classification.productClass} · ${classification.keywords.length} keywords.` : "Could not classify.",
++    });
++  }
++  const productClass = classification?.productClass || idea.category || idea.title;
++  const webQuery =
++    (classification?.keywords?.length ? classification.keywords.join(" ") : `${idea.title} ${idea.category}`.trim()) +
++    " similar products";
++
++  // 2. Run sources in parallel: Amazon (stores), Firecrawl (web), AliExpress (China suppliers), Firecrawl (web suppliers).
++  const [amazon, benchRes, aliexpress, webSuppliers] = await Promise.all([
++    apifyEnabled() ? amazonSearch(productClass, 8) : Promise.resolve<Competitor[]>([]),
++    firecrawlEnabled() ? benchmarkViaFirecrawl(webQuery) : Promise.resolve(null),
++    apifyEnabled() ? aliexpressSuppliers(productClass, 8) : Promise.resolve<Supplier[]>([]),
++    firecrawlEnabled() ? findWebSuppliers(productClass) : Promise.resolve<Supplier[]>([]),
++  ]);
++
++  if (apifyEnabled()) {
++    agents.push({
++      id: "amazon",
++      name: "Online Stores (Amazon)",
++      description: "Pulls live Amazon listings: brands, prices, ratings.",
++      status: amazon.length ? "complete" : "error",
++      detail: amazon.length ? `Found ${amazon.length} Amazon listings.` : "No Amazon listings found.",
++    });
++  }
++  if (firecrawlEnabled()) {
++    const fc = benchRes?.competitors ?? [];
++    agents.push({
++      id: "web",
++      name: "Web Research (Firecrawl)",
++      description: "Finds and extracts similar products across the web.",
++      status: benchRes && benchRes.found ? "complete" : "error",
++      detail: benchRes ? `Found ${benchRes.found} web sources · benchmarked ${fc.length}.` : "No web results.",
++    });
++  }
++  if (apifyEnabled()) {
++    agents.push({
++      id: "aliexpress",
++      name: "China Suppliers (AliExpress)",
++      description: "Finds China suppliers, wholesale prices and demand.",
++      status: aliexpress.length ? "complete" : "error",
++      detail: aliexpress.length ? `Found ${aliexpress.length} AliExpress suppliers.` : "No AliExpress results.",
++    });
++  }
++  if (firecrawlEnabled()) {
++    agents.push({
++      id: "web-suppliers",
++      name: "Web Sourcing (Firecrawl)",
++      description: "Finds manufacturers and suppliers on the web.",
++      status: webSuppliers.length ? "complete" : "error",
++      detail: webSuppliers.length ? `Found ${webSuppliers.length} supplier leads.` : "No suppliers found.",
++    });
++  }
++
++  // Combine sources.
++  const competitors = dedupeCompetitors([...amazon, ...(benchRes?.competitors ?? [])]).slice(0, 12);
++  const suppliers = dedupeSuppliers([...aliexpress, ...webSuppliers]).slice(0, 10);
++  const sources = benchRes?.sources ?? [];
++
++  const priceRange = priceRangeOf(competitors);
++  const makers = buildMakers(competitors);
++  const insights = buildInsights(idea, competitors, suppliers, priceRange);
++  const enrichment = buildEnrichment(idea, competitors, classification);
++
++  if (!competitors.length && !suppliers.length && !classification) {
++    return runDemo(idea, started);
++  }
++
++  const result: ResearchResult = {
++    mode: "live",
++    ranAt: new Date().toISOString(),
++    durationMs: 0,
++    enrichment,
++    classification,
++    benchmark: { competitors, priceRange, insights },
++    suppliers,
++    makers,
++    agents,
++    sources,
++  };
++
++  // Strategy analyst (Claude) — reasons over the combined benchmark.
++  if (llmEnabled()) {
++    const analysis = await analyzeWithClaude(idea, competitors, priceRange);
++    if (analysis) {
++      result.analysis = analysis;
++      agents.push({
++        id: "analyst",
++        name: "Strategy Analyst",
++        description: "Turns the research into positioning, pricing and next steps.",
++        status: "complete",
++        detail: `Produced positioning, ${analysis.differentiation.length} differentiators and ${analysis.nextSteps.length} next steps.`,
++      });
++    } else {
++      agents.push({
++        id: "analyst",
++        name: "Strategy Analyst",
++        description: "Turns the research into positioning, pricing and next steps.",
++        status: "error",
++        detail: "Analysis could not be generated.",
++      });
++    }
++  }
++
++  result.durationMs = Date.now() - started;
++  return result;
++}
+diff --git a/web/lib/ideas/apify.ts b/web/lib/ideas/apify.ts
+new file mode 100644
+index 0000000..428c5fc
+--- /dev/null
++++ b/web/lib/ideas/apify.ts
+@@ -0,0 +1,124 @@
++import "server-only";
++
++import type { Competitor, Supplier } from "./types";
++
++/* Apify agents — marketplace-native scrapers for Amazon (online stores) and
++ * AliExpress (China suppliers). Degrade gracefully: with no APIFY_API_TOKEN
++ * every call returns an empty list. */
++
++const BASE = "https://api.apify.com/v2";
++
++// Marketplace-native actors (richer than generic web extraction).
++const AMAZON_ACTOR = "junglee~Amazon-crawler";
++const ALIEXPRESS_ACTOR = "thirdwatch~aliexpress-product-scraper";
++
++export function apifyEnabled(): boolean {
++  return Boolean(process.env.APIFY_API_TOKEN);
++}
++
++function normalizeCurrency(c: string): string {
++  const up = (c || "").toUpperCase();
++  if (up === "$" || up === "US$") return "USD";
++  if (up === "£") return "GBP";
++  if (up === "€") return "EUR";
++  if (up === "A$") return "AUD";
++  return up;
++}
++
++async function runActor(
++  actorId: string,
++  input: unknown,
++  timeoutMs: number
++): Promise<Record<string, unknown>[] | null> {
++  const token = process.env.APIFY_API_TOKEN;
++  if (!token) return null;
++
++  const ctrl = new AbortController();
++  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
++  try {
++    const res = await fetch(
++      `${BASE}/acts/${actorId}/run-sync-get-dataset-items?token=${token}`,
++      {
++        method: "POST",
++        headers: { "Content-Type": "application/json" },
++        body: JSON.stringify(input),
++        signal: ctrl.signal,
++        cache: "no-store",
++      }
++    );
++    if (!res.ok) return null;
++    const data = await res.json();
++    if (Array.isArray(data)) return data as Record<string, unknown>[];
++    const items = (data as { items?: unknown })?.items;
++    return Array.isArray(items) ? (items as Record<string, unknown>[]) : null;
++  } catch {
++    return null;
++  } finally {
++    clearTimeout(timer);
++  }
++}
++
++// Amazon — the dominant online store: brands, prices, sellers, ratings, reviews.
++export async function amazonSearch(query: string, limit = 8): Promise<Competitor[]> {
++  const url = `https://www.amazon.com/s?k=${encodeURIComponent(query)}`;
++  const items = await runActor(
++    AMAZON_ACTOR,
++    { categoryOrProductUrls: [{ url }], maxItemsPerStartUrl: limit, maxSearchPagesPerStartUrl: 1 },
++    180_000
++  );
++  if (!items) return [];
++
++  return items
++    .map((i) => i as Record<string, unknown>)
++    .filter((i) => i?.title && (i?.price as Record<string, unknown>)?.value)
++    .slice(0, limit)
++    .map((i) => {
++      const price = i.price as { value?: unknown; currency?: unknown };
++      const cur = normalizeCurrency(String(price?.currency || "$"));
++      return {
++        name: String(i.title).trim(),
++        brand: i.brand ? String(i.brand).trim() : "",
++        price: `${cur === "USD" ? "$" : cur + " "}${price.value}`,
++        priceValue: typeof price.value === "number" ? price.value : null,
++        currency: cur,
++        features: [],
++        url: i.url ? String(i.url) : "",
++        source: "amazon.com",
++        rating: typeof i.stars === "number" ? i.stars : null,
++        reviews: typeof i.reviewsCount === "number" ? i.reviewsCount : null,
++      } satisfies Competitor;
++    });
++}
++
++// AliExpress — China sellers/suppliers: wholesale-ish prices, order volume, ratings.
++export async function aliexpressSuppliers(query: string, limit = 8): Promise<Supplier[]> {
++  const items = await runActor(
++    ALIEXPRESS_ACTOR,
++    {
++      queries: [query],
++      maxResults: limit,
++      country: "US",
++      proxyConfiguration: { useApifyProxy: true },
++    },
++    180_000
++  );
++  if (!items) return [];
++
++  return items
++    .map((i) => i as Record<string, unknown>)
++    .filter((i) => i?.title && i?.url)
++    .slice(0, limit)
++    .map((i) => {
++      const cur = normalizeCurrency(String(i.sale_price_currency || "USD"));
++      const price = i.sale_price != null ? `${cur === "USD" ? "$" : cur + " "}${i.sale_price}` : "";
++      return {
++        name: String(i.title).trim(),
++        url: String(i.url),
++        snippet: Array.isArray(i.selling_points) ? i.selling_points.join(" · ") : "",
++        price,
++        orders: typeof i.orders_count === "number" ? i.orders_count : null,
++        rating: typeof i.rating === "number" ? i.rating : null,
++        source: "aliexpress",
++      } satisfies Supplier;
++    });
++}
+diff --git a/web/lib/ideas/firecrawl.ts b/web/lib/ideas/firecrawl.ts
+new file mode 100644
+index 0000000..5023b88
+--- /dev/null
++++ b/web/lib/ideas/firecrawl.ts
+@@ -0,0 +1,98 @@
++import "server-only";
++
++/* Firecrawl agent — web search + per-page product extraction for the benchmark.
++ * Degrades gracefully: with no FIRECRAWL_API_KEY every call returns empty. */
++
++const BASE = "https://api.firecrawl.dev/v2";
++
++export type SearchResult = { title: string; url: string; description: string };
++
++export type ExtractedProduct = {
++  productName?: string;
++  brand?: string;
++  price?: string;
++  keyFeatures?: string[];
++  summary?: string;
++};
++
++export function firecrawlEnabled(): boolean {
++  return Boolean(process.env.FIRECRAWL_API_KEY);
++}
++
++function headers() {
++  return {
++    Authorization: `Bearer ${process.env.FIRECRAWL_API_KEY}`,
++    "Content-Type": "application/json",
++  };
++}
++
++async function postJSON(path: string, body: unknown, timeoutMs: number): Promise<unknown> {
++  const ctrl = new AbortController();
++  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
++  try {
++    const res = await fetch(`${BASE}${path}`, {
++      method: "POST",
++      headers: headers(),
++      body: JSON.stringify(body),
++      signal: ctrl.signal,
++      cache: "no-store",
++    });
++    if (!res.ok) return null;
++    return await res.json();
++  } catch {
++    return null;
++  } finally {
++    clearTimeout(timer);
++  }
++}
++
++export async function search(query: string, limit = 6): Promise<SearchResult[]> {
++  const data = (await postJSON("/search", { query, limit, sources: ["web"] }, 30_000)) as
++    | { data?: { web?: unknown[] } | unknown[] }
++    | null;
++  const dataField = data?.data as { web?: unknown[] } | unknown[] | undefined;
++  const web = Array.isArray(dataField)
++    ? dataField
++    : ((dataField as { web?: unknown[] })?.web ?? []);
++  if (!Array.isArray(web)) return [];
++  return web
++    .map((r) => r as Record<string, unknown>)
++    .filter((r) => r?.url)
++    .map((r) => ({
++      title: String(r.title ?? r.url),
++      url: String(r.url),
++      description: String(r.description ?? ""),
++    }));
++}
++
++export async function extractProduct(url: string): Promise<ExtractedProduct | null> {
++  const data = (await postJSON(
++    "/scrape",
++    {
++      url,
++      onlyMainContent: true,
++      timeout: 45_000,
++      formats: [
++        {
++          type: "json",
++          prompt:
++            "Extract details about the single main product on this page for competitive benchmarking. If this is a category/listing page, use the first or most prominent product.",
++          schema: {
++            type: "object",
++            properties: {
++              productName: { type: "string" },
++              brand: { type: "string" },
++              price: { type: "string", description: "Include currency symbol/code, e.g. $42.95 USD" },
++              keyFeatures: { type: "array", items: { type: "string" } },
++              summary: { type: "string", description: "One concise sentence about the product" },
++            },
++          },
++        },
++      ],
++    },
++    55_000
++  )) as { data?: { json?: unknown } } | null;
++  const json = data?.data?.json;
++  if (!json || typeof json !== "object") return null;
++  return json as ExtractedProduct;
++}
+diff --git a/web/lib/ideas/integration.ts b/web/lib/ideas/integration.ts
+new file mode 100644
+index 0000000..898af76
+--- /dev/null
++++ b/web/lib/ideas/integration.ts
+@@ -0,0 +1,164 @@
++import "server-only";
++
++import type { SupabaseClient } from "@supabase/supabase-js";
++import type { Maker, ProductIdea, ResearchResult, Supplier } from "./types";
++import { supabaseAdmin, supabaseAdminEnabled } from "./supabase-admin";
++import { parsePrice } from "./price";
++
++/**
++ * Fan an idea's research out into RSI's canonical shared tables. Best-effort: a
++ * write-back failure never blocks the research response.
++ *
++ * Reconciled to RSI's schema (see pipelines/src/rsi/models.py):
++ * - resolve-or-create on `product_categories`, then stamp `product_ideas.category_id`.
++ * - `suppliers(name, country_code, category_id, external_id, source)`.
++ * - `competitors(name, home_country)` — the non-schema `source` column SupplyScope
++ *   used is dropped.
++ * - The analysis lands as a row in the existing `triggers` table
++ *   (score, rationale, payload JSON, status, category_id).
++ * - We deliberately do NOT write to `snapshots` (the dashboard reads the latest
++ *   snapshot as its whole view-model) or to `insights`.
++ */
++
++function aliexpressId(url: string): string | null {
++  const m = url.match(/\/item\/(\d+)\.html/);
++  return m ? m[1] : null;
++}
++
++async function resolveCategoryId(
++  sb: SupabaseClient,
++  name: string,
++  keywords: string[]
++): Promise<number | null> {
++  if (!name) return null;
++  const { data: existing } = await sb.from("product_categories").select("id").ilike("name", name).limit(1);
++  if (existing && existing.length) return existing[0].id as number;
++  const { data: inserted, error } = await sb
++    .from("product_categories")
++    .insert({ name: name.slice(0, 128), keywords: keywords ?? [] })
++    .select("id")
++    .single();
++  if (!error && inserted) return inserted.id as number;
++  const { data: again } = await sb.from("product_categories").select("id").ilike("name", name).limit(1);
++  return again && again.length ? (again[0].id as number) : null;
++}
++
++async function validCountryCodes(sb: SupabaseClient): Promise<Set<string>> {
++  const { data } = await sb.from("countries").select("code");
++  return new Set((data ?? []).map((r: { code: string }) => r.code));
++}
++
++async function writeSuppliers(
++  sb: SupabaseClient,
++  categoryId: number | null,
++  suppliers: Supplier[],
++  codes: Set<string>
++): Promise<void> {
++  if (!suppliers.length) return;
++  const names = suppliers.map((s) => s.name);
++  const { data: existing } = await sb.from("suppliers").select("name").in("name", names);
++  const have = new Set((existing ?? []).map((r: { name: string }) => r.name));
++  const rows = suppliers
++    .filter((s) => !have.has(s.name))
++    .map((s) => ({
++      name: s.name.slice(0, 256),
++      country_code: s.source === "aliexpress" && codes.has("CN") ? "CN" : null,
++      category_id: categoryId,
++      external_id: s.source === "aliexpress" ? aliexpressId(s.url) : null,
++      source: s.source || "web",
++    }));
++  if (rows.length) await sb.from("suppliers").insert(rows);
++}
++
++async function writeCompetitors(sb: SupabaseClient, makers: Maker[]): Promise<void> {
++  // RSI's competitors table is (name, home_country) — no `source` column.
++  const rows = makers
++    .map((m) => m.name)
++    .filter(Boolean)
++    .map((n) => ({ name: n.slice(0, 128) }));
++  if (rows.length) await sb.from("competitors").upsert(rows, { onConflict: "name", ignoreDuplicates: true });
++}
++
++function buildRationale(idea: ProductIdea, research: ResearchResult): string {
++  const a = research.analysis;
++  const parts: string[] = [];
++  if (a?.positioning) parts.push(a.positioning);
++  if (a?.suggestedPrice) parts.push(`Suggested price: ${a.suggestedPrice}.`);
++  if (a?.differentiation?.length) parts.push(`Differentiation: ${a.differentiation.join("; ")}.`);
++  if (a?.nextSteps?.length) parts.push(`Next steps: ${a.nextSteps.join("; ")}.`);
++  if (!parts.length && research.benchmark.insights.length) parts.push(research.benchmark.insights.join(" "));
++  if (!parts.length) parts.push(`${idea.title}: market scan`);
++  return parts.join(" ").slice(0, 1024);
++}
++
++// Crude opportunity score on RSI's 0..100 trigger scale: retail average vs the
++// cheapest supplier (higher margin -> higher score).
++function marginScore(research: ResearchResult): number {
++  const pr = research.benchmark.priceRange;
++  const lows = (research.suppliers ?? [])
++    .map((s) => parsePrice(s.price).value)
++    .filter((v): v is number => v != null && v > 0);
++  if (pr && lows.length && pr.avg > 0) {
++    return Math.max(0, Math.min(100, Math.round((1 - Math.min(...lows) / pr.avg) * 100)));
++  }
++  return 50;
++}
++
++async function writeTrigger(
++  sb: SupabaseClient,
++  categoryId: number | null,
++  idea: ProductIdea,
++  research: ResearchResult
++): Promise<void> {
++  await sb.from("triggers").insert({
++    category_id: categoryId,
++    score: marginScore(research),
++    rationale: buildRationale(idea, research),
++    status: "new",
++    payload: {
++      kind: "validate_idea",
++      idea_id: idea.id,
++      idea: { title: idea.title, category: idea.category },
++      suggested_price: research.analysis?.suggestedPrice ?? null,
++      price_range: research.benchmark.priceRange,
++      competitors: research.benchmark.competitors.slice(0, 5).map((c) => ({
++        name: c.name,
++        brand: c.brand,
++        price: c.price,
++        rating: c.rating ?? null,
++      })),
++      suppliers: (research.suppliers ?? []).slice(0, 5).map((s) => ({
++        name: s.name,
++        price: s.price ?? null,
++        orders: s.orders ?? null,
++        source: s.source ?? null,
++        url: s.url,
++      })),
++    },
++  });
++}
++
++export async function connectResearch(
++  idea: ProductIdea,
++  research: ResearchResult
++): Promise<{ categoryId: number | null }> {
++  if (!supabaseAdminEnabled()) return { categoryId: null };
++  const sb = supabaseAdmin()!;
++  let categoryId: number | null = null;
++  try {
++    const catName = research.classification?.category || idea.category;
++    categoryId = await resolveCategoryId(sb, catName, research.classification?.keywords ?? []);
++    if (categoryId != null) {
++      await sb.from("product_ideas").update({ category_id: categoryId }).eq("id", idea.id);
++    }
++    const codes = await validCountryCodes(sb);
++    await Promise.allSettled([
++      writeSuppliers(sb, categoryId, research.suppliers ?? [], codes),
++      writeCompetitors(sb, research.makers ?? []),
++      writeTrigger(sb, categoryId, idea, research),
++    ]);
++  } catch {
++    // never block the research response on a write-back failure
++  }
++  return { categoryId };
++}
+diff --git a/web/lib/ideas/llm.ts b/web/lib/ideas/llm.ts
+new file mode 100644
+index 0000000..dd80a34
+--- /dev/null
++++ b/web/lib/ideas/llm.ts
+@@ -0,0 +1,175 @@
++import "server-only";
++
++import type { Classification, Competitor, ProductIdea, ResearchResult } from "./types";
++
++/* Claude agents — product classifier (vision-aware) and strategy analyst.
++ *
++ * Ported from SupplyScope's @anthropic-ai/sdk usage to a raw fetch against the
++ * Anthropic Messages API, matching RSI's app/api/extract/route.ts (no extra
++ * dependency). Structured output is obtained via a single forced tool call.
++ *
++ * Key resolution mirrors the rest of RSI's server routes:
++ *   ANTHROPIC_API_KEY       preferred
++ *   RSI_ANTHROPIC_API_KEY   fallback (same key the pipeline already uses)
++ * With no key llmEnabled() is false and the pipeline degrades to demo data. */
++
++export type CompetitiveAnalysis = {
++  summary: string;
++  positioning: string;
++  differentiation: string[];
++  risks: string[];
++  suggestedPrice: string;
++  nextSteps: string[];
++};
++
++const MODEL = process.env.ANTHROPIC_MODEL || "claude-sonnet-4-6";
++const API_URL = "https://api.anthropic.com/v1/messages";
++
++function apiKey(): string | undefined {
++  return process.env.ANTHROPIC_API_KEY || process.env.RSI_ANTHROPIC_API_KEY;
++}
++
++export function llmEnabled(): boolean {
++  return Boolean(apiKey());
++}
++
++type ContentBlock = Record<string, unknown>;
++
++// Call the Messages API with a forced single-tool call so the model returns a
++// strictly-shaped JSON object (the tool's input). Returns null on any failure.
++async function structuredCall<T>(
++  content: ContentBlock[],
++  toolName: string,
++  schema: Record<string, unknown>,
++  maxTokens: number
++): Promise<T | null> {
++  const key = apiKey();
++  if (!key) return null;
++  try {
++    const res = await fetch(API_URL, {
++      method: "POST",
++      headers: {
++        "x-api-key": key,
++        "anthropic-version": "2023-06-01",
++        "content-type": "application/json",
++      },
++      body: JSON.stringify({
++        model: MODEL,
++        max_tokens: maxTokens,
++        tools: [{ name: toolName, description: "Return the requested structured result.", input_schema: schema }],
++        tool_choice: { type: "tool", name: toolName },
++        messages: [{ role: "user", content }],
++      }),
++    });
++    if (!res.ok) return null;
++    const data = await res.json();
++    const block = (data.content as { type?: string; input?: unknown }[] | undefined)?.find(
++      (b) => b.type === "tool_use"
++    );
++    if (!block?.input) return null;
++    return block.input as T;
++  } catch {
++    return null;
++  }
++}
++
++const CLASSIFICATION_SCHEMA = {
++  type: "object",
++  additionalProperties: false,
++  properties: {
++    category: { type: "string", description: "Broad product category, e.g. 'Drinkware & Kitchen'." },
++    productClass: { type: "string", description: "Concise product class to search for to find similar products, e.g. 'insulated stainless steel water bottle'." },
++    keywords: { type: "array", items: { type: "string" }, description: "3-6 search keywords for finding comparable products." },
++    attributes: { type: "array", items: { type: "string" }, description: "Notable attributes/materials/features inferred." },
++    summary: { type: "string", description: "One-line description of what the product is." },
++  },
++  required: ["category", "productClass", "keywords", "attributes", "summary"],
++};
++
++const ANALYSIS_SCHEMA = {
++  type: "object",
++  additionalProperties: false,
++  properties: {
++    summary: { type: "string", description: "2-3 sentence executive summary of the opportunity." },
++    positioning: { type: "string", description: "How this product should be positioned against the market." },
++    differentiation: { type: "array", items: { type: "string" }, description: "Concrete ways the product can stand out." },
++    risks: { type: "array", items: { type: "string" }, description: "Key risks, gaps or concerns to watch." },
++    suggestedPrice: { type: "string", description: "A specific recommended price or range, with currency." },
++    nextSteps: { type: "array", items: { type: "string" }, description: "Recommended next actions for the team." },
++  },
++  required: ["summary", "positioning", "differentiation", "risks", "suggestedPrice", "nextSteps"],
++};
++
++function imageBlock(imageUrl: string): ContentBlock | null {
++  if (!imageUrl) return null;
++  const m = imageUrl.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
++  if (m) return { type: "image", source: { type: "base64", media_type: m[1], data: m[2] } };
++  if (/^https?:\/\//.test(imageUrl)) return { type: "image", source: { type: "url", url: imageUrl } };
++  return null;
++}
++
++export async function classifyProduct(idea: ProductIdea): Promise<Classification | null> {
++  if (!llmEnabled()) return null;
++
++  const content: ContentBlock[] = [];
++  const img = imageBlock(idea.imageUrl);
++  if (img) content.push(img);
++  content.push({
++    type: "text",
++    text:
++      "Classify this product idea for market research. Use the image if one is provided.\n" +
++      `Title: ${idea.title}\n` +
++      `Description: ${idea.description || "(none)"}\n` +
++      `Stated category: ${idea.category || "(none)"}\n` +
++      `Features: ${idea.features || "(none)"}\n\n` +
++      "Return the category, a concise product class to search for, search keywords, key attributes, and a one-line summary.",
++  });
++
++  const parsed = await structuredCall<Classification>(content, "classify_product", CLASSIFICATION_SCHEMA, 1200);
++  if (!parsed?.productClass) return null;
++  return parsed;
++}
++
++function buildAnalysisPrompt(
++  idea: ProductIdea,
++  competitors: Competitor[],
++  priceRange: ResearchResult["benchmark"]["priceRange"]
++): string {
++  const compLines = competitors
++    .map((c) => `- ${c.name} (${c.brand}) — ${c.price || "price n/a"} — ${c.features.join("; ") || "no features listed"}`)
++    .join("\n");
++  const range = priceRange
++    ? `Market price range: ${priceRange.currency} ${Math.round(priceRange.min)}–${Math.round(priceRange.max)} (avg ${Math.round(priceRange.avg)}).`
++    : "No reliable market pricing was extracted.";
++
++  return [
++    "You are a product strategist helping a team evaluate a new product idea against the live market.",
++    "",
++    "PRODUCT IDEA",
++    `Title: ${idea.title}`,
++    `Description: ${idea.description || "(none)"}`,
++    `Category: ${idea.category || "(unspecified)"}`,
++    `Target market: ${idea.targetMarket || "(unspecified)"}`,
++    `Target audience: ${idea.audience || "(unspecified)"}`,
++    `Target price: ${idea.priceTarget || "(unspecified)"}`,
++    `Key features: ${idea.features || "(none provided)"}`,
++    "",
++    "BENCHMARKED COMPETITORS (from live web research)",
++    compLines || "(no comparable products were found)",
++    range,
++    "",
++    "Produce a concise, decision-useful competitive analysis. Reference specific competitors and pricing where relevant. Be concrete and avoid generic filler.",
++  ].join("\n");
++}
++
++export async function analyzeWithClaude(
++  idea: ProductIdea,
++  competitors: Competitor[],
++  priceRange: ResearchResult["benchmark"]["priceRange"]
++): Promise<CompetitiveAnalysis | null> {
++  if (!llmEnabled()) return null;
++  const content: ContentBlock[] = [{ type: "text", text: buildAnalysisPrompt(idea, competitors, priceRange) }];
++  const parsed = await structuredCall<CompetitiveAnalysis>(content, "competitive_analysis", ANALYSIS_SCHEMA, 4000);
++  if (!parsed?.summary || !Array.isArray(parsed.differentiation)) return null;
++  return parsed;
++}
+diff --git a/web/lib/ideas/price.ts b/web/lib/ideas/price.ts
+new file mode 100644
+index 0000000..a12e333
+--- /dev/null
++++ b/web/lib/ideas/price.ts
+@@ -0,0 +1,28 @@
++// Shared price parsing used by several research agents.
++export function parsePrice(input?: string | null): { value: number | null; currency: string } {
++  if (!input) return { value: null, currency: "" };
++  const text = String(input).replace(/,/g, "");
++  const currencyMatch = text.match(/(A\$|US\$|\$|£|€|¥|USD|AUD|GBP|EUR|NZD|CAD)/i);
++  const numberMatch = text.match(/(\d+(?:\.\d{1,2})?)/);
++  const rawCur = currencyMatch ? currencyMatch[1].toUpperCase() : "";
++  const currency = rawCur
++    .replace("US$", "USD")
++    .replace("A$", "AUD")
++    .replace("$", "USD");
++  return {
++    value: numberMatch ? parseFloat(numberMatch[1]) : null,
++    currency,
++  };
++}
++
++export function priceRangeOf(
++  rows: { priceValue: number | null; currency: string }[]
++): { min: number; max: number; avg: number; currency: string } | null {
++  const values = rows.map((r) => r.priceValue).filter((v): v is number => v != null && v > 0);
++  if (!values.length) return null;
++  const min = Math.min(...values);
++  const max = Math.max(...values);
++  const avg = values.reduce((a, b) => a + b, 0) / values.length;
++  const currency = rows.find((r) => r.currency)?.currency || "USD";
++  return { min, max, avg, currency };
++}
+diff --git a/web/lib/ideas/store.ts b/web/lib/ideas/store.ts
+new file mode 100644
+index 0000000..8b632b3
+--- /dev/null
++++ b/web/lib/ideas/store.ts
+@@ -0,0 +1,163 @@
++import "server-only";
++
++import { randomUUID } from "node:crypto";
++import type { NewIdeaInput, ProductIdea } from "./types";
++import { supabaseAdmin, supabaseAdminEnabled } from "./supabase-admin";
++
++/**
++ * Persistence for product ideas.
++ *
++ * - With Supabase configured (service-role key), ideas live in the
++ *   `product_ideas` table (see supabase/migrations/0006_product_ideas.sql and
++ *   pipelines/src/rsi/models.py::ProductIdea).
++ * - Without it, an in-memory map keeps the feature working for build/runtime.
++ *   This is module-scoped, not a file on disk — serverless cold starts reset it,
++ *   which is fine: the demo flow creates and researches within one process, and
++ *   results are echoed back to the client.
++ *
++ * The canonical `product_ideas` columns are a subset of ProductIdea (title,
++ * description, category_id, image_url, target_market, target_price, status,
++ * research, created_at). The auxiliary free-text inputs (audience, features,
++ * submittedBy, the typed category label) are carried in the in-memory store and
++ * in the request flow; on the Supabase read path they are reconstructed from the
++ * columns available, which is sufficient for the research pipeline.
++ */
++
++const TABLE = "product_ideas";
++
++const mem = new Map<string, ProductIdea>();
++
++function newIdea(input: NewIdeaInput): ProductIdea {
++  return {
++    id: randomUUID(),
++    createdAt: new Date().toISOString(),
++    title: input.title.trim(),
++    description: (input.description || "").trim(),
++    category: (input.category || "").trim(),
++    targetMarket: (input.targetMarket || "").trim(),
++    audience: (input.audience || "").trim(),
++    priceTarget: (input.priceTarget || "").trim(),
++    features: (input.features || "").trim(),
++    imageUrl: (input.imageUrl || "").trim(),
++    submittedBy: (input.submittedBy || "").trim(),
++    status: "queued",
++  };
++}
++
++/* ---------- Supabase row mapping ---------- */
++
++function rowToIdea(row: Record<string, unknown>): ProductIdea {
++  return {
++    id: String(row.id),
++    createdAt: String(row.created_at ?? new Date().toISOString()),
++    title: String(row.title ?? ""),
++    description: String(row.description ?? ""),
++    category: String(row.category ?? ""),
++    targetMarket: String(row.target_market ?? ""),
++    audience: String(row.audience ?? ""),
++    priceTarget: String(row.target_price ?? ""),
++    features: String(row.features ?? ""),
++    imageUrl: String(row.image_url ?? ""),
++    submittedBy: String(row.submitted_by ?? ""),
++    status: (row.status as ProductIdea["status"]) ?? "queued",
++    research: (row.research as ProductIdea["research"]) ?? undefined,
++  };
++}
++
++function ideaToRow(idea: ProductIdea): Record<string, unknown> {
++  return {
++    id: idea.id,
++    title: idea.title,
++    description: idea.description,
++    image_url: idea.imageUrl || null,
++    target_market: idea.targetMarket || null,
++    target_price: idea.priceTarget || null,
++    category: idea.category || null,
++    audience: idea.audience || null,
++    features: idea.features || null,
++    submitted_by: idea.submittedBy || null,
++    status: idea.status,
++    research: idea.research ?? null,
++  };
++}
++
++/* ---------- Public API ---------- */
++
++export async function listIdeas(): Promise<ProductIdea[]> {
++  if (supabaseAdminEnabled()) {
++    const { data, error } = await supabaseAdmin()!
++      .from(TABLE)
++      .select("*")
++      .order("created_at", { ascending: false });
++    if (error) throw error;
++    return (data ?? []).map((r) => rowToIdea(r as Record<string, unknown>));
++  }
++  return [...mem.values()].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
++}
++
++export async function getIdea(id: string): Promise<ProductIdea | undefined> {
++  if (supabaseAdminEnabled()) {
++    const { data, error } = await supabaseAdmin()!.from(TABLE).select("*").eq("id", id).maybeSingle();
++    if (error) throw error;
++    return data ? rowToIdea(data as Record<string, unknown>) : undefined;
++  }
++  return mem.get(id);
++}
++
++export async function createIdea(input: NewIdeaInput): Promise<ProductIdea> {
++  const idea = newIdea(input);
++
++  if (supabaseAdminEnabled()) {
++    const { data, error } = await supabaseAdmin()!
++      .from(TABLE)
++      .insert(ideaToRow(idea))
++      .select("*")
++      .single();
++    if (error) throw error;
++    // Keep the rich input fields available for the immediate research call.
++    const merged = { ...idea, ...rowToIdea(data as Record<string, unknown>), id: idea.id };
++    merged.category = idea.category;
++    merged.audience = idea.audience;
++    merged.features = idea.features;
++    merged.submittedBy = idea.submittedBy;
++    mem.set(merged.id, merged);
++    return merged;
++  }
++
++  mem.set(idea.id, idea);
++  return idea;
++}
++
++export async function updateIdea(
++  id: string,
++  patch: Partial<ProductIdea>
++): Promise<ProductIdea | undefined> {
++  if (supabaseAdminEnabled()) {
++    const row: Record<string, unknown> = {};
++    if (patch.status !== undefined) row.status = patch.status;
++    if (patch.research !== undefined) row.research = patch.research;
++    if (patch.title !== undefined) row.title = patch.title;
++    if (patch.description !== undefined) row.description = patch.description;
++    if (patch.imageUrl !== undefined) row.image_url = patch.imageUrl;
++    if (patch.targetMarket !== undefined) row.target_market = patch.targetMarket;
++    if (patch.priceTarget !== undefined) row.target_price = patch.priceTarget;
++    const { data, error } = await supabaseAdmin()!
++      .from(TABLE)
++      .update(row)
++      .eq("id", id)
++      .select("*")
++      .maybeSingle();
++    if (error) throw error;
++    if (!data) return undefined;
++    const prev = mem.get(id);
++    const merged = { ...(prev ?? {}), ...rowToIdea(data as Record<string, unknown>), ...patch, id };
++    mem.set(id, merged as ProductIdea);
++    return merged as ProductIdea;
++  }
++
++  const prev = mem.get(id);
++  if (!prev) return undefined;
++  const next = { ...prev, ...patch, id };
++  mem.set(id, next);
++  return next;
++}
+diff --git a/web/lib/ideas/supabase-admin.ts b/web/lib/ideas/supabase-admin.ts
+new file mode 100644
+index 0000000..57a9a61
+--- /dev/null
++++ b/web/lib/ideas/supabase-admin.ts
+@@ -0,0 +1,38 @@
++import "server-only";
++
++import { createClient, type SupabaseClient } from "@supabase/supabase-js";
++
++/**
++ * Server-only Supabase client using the service-role key — for trusted writes
++ * from the "Validate" API routes (creating ideas, fanning research out into the
++ * shared RSI tables). It bypasses RLS, so it must never be imported into a
++ * client component.
++ *
++ * Env (server-side only; never NEXT_PUBLIC):
++ *   SUPABASE_URL                 (falls back to NEXT_PUBLIC_SUPABASE_URL)
++ *   SUPABASE_SERVICE_ROLE_KEY    required for live writes
++ *
++ * With either unset, supabaseAdminEnabled() is false and callers fall back to
++ * the in-memory store in lib/ideas/store.ts — so build and runtime work without
++ * a database (this runs on serverless; never write files to disk).
++ */
++
++let client: SupabaseClient | null = null;
++
++function url(): string | undefined {
++  return process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL;
++}
++
++export function supabaseAdminEnabled(): boolean {
++  return Boolean(url() && process.env.SUPABASE_SERVICE_ROLE_KEY);
++}
++
++export function supabaseAdmin(): SupabaseClient | null {
++  if (!supabaseAdminEnabled()) return null;
++  if (!client) {
++    client = createClient(url()!, process.env.SUPABASE_SERVICE_ROLE_KEY!, {
++      auth: { persistSession: false, autoRefreshToken: false },
++    });
++  }
++  return client;
++}
+diff --git a/web/lib/ideas/types.ts b/web/lib/ideas/types.ts
+new file mode 100644
+index 0000000..ec437c9
+--- /dev/null
++++ b/web/lib/ideas/types.ts
+@@ -0,0 +1,109 @@
++/* Types for the "Validate" feature — submit a product idea, then run a
++ * multi-agent research & benchmark pass. Ported from SupplyScope; namespaced
++ * under lib/ideas/ so it never collides with the dashboard view-model types. */
++
++export type IdeaStatus = "queued" | "researching" | "complete" | "error";
++
++export type ProductIdea = {
++  id: string;
++  createdAt: string;
++  title: string;
++  description: string;
++  category: string;
++  targetMarket: string;
++  audience: string;
++  priceTarget: string;
++  features: string;
++  imageUrl: string;
++  submittedBy: string;
++  status: IdeaStatus;
++  research?: ResearchResult;
++};
++
++export type Competitor = {
++  name: string;
++  brand: string;
++  price: string;
++  priceValue: number | null;
++  currency: string;
++  features: string[];
++  url: string;
++  source: string;
++  rating?: number | null;
++  reviews?: number | null;
++};
++
++export type AgentRunInfo = {
++  id: string;
++  name: string;
++  description: string;
++  status: "complete" | "error" | "skipped";
++  detail: string;
++};
++
++export type Classification = {
++  category: string;
++  productClass: string;
++  keywords: string[];
++  attributes: string[];
++  summary: string;
++};
++
++export type Supplier = {
++  name: string;
++  url: string;
++  snippet: string;
++  price?: string;
++  orders?: number | null;
++  rating?: number | null;
++  source?: string;
++};
++
++export type Maker = {
++  name: string;
++  offers: number;
++  lowestPrice: string;
++};
++
++export type ResearchResult = {
++  mode: "live" | "demo";
++  ranAt: string;
++  durationMs: number;
++  enrichment: {
++    suggestedCategory: string;
++    tags: string[];
++    targetAudience: string;
++    summary: string;
++  };
++  benchmark: {
++    competitors: Competitor[];
++    priceRange: { min: number; max: number; avg: number; currency: string } | null;
++    insights: string[];
++  };
++  classification?: Classification | null;
++  suppliers?: Supplier[];
++  makers?: Maker[];
++  analysis?: {
++    summary: string;
++    positioning: string;
++    differentiation: string[];
++    risks: string[];
++    suggestedPrice: string;
++    nextSteps: string[];
++  } | null;
++  agents: AgentRunInfo[];
++  sources: { title: string; url: string }[];
++  error?: string;
++};
++
++export type NewIdeaInput = {
++  title: string;
++  description?: string;
++  category?: string;
++  targetMarket?: string;
++  audience?: string;
++  priceTarget?: string;
++  features?: string;
++  imageUrl?: string;
++  submittedBy?: string;
++};
+diff --git a/web/lib/types.ts b/web/lib/types.ts
+index 0d87b3c..06d52ac 100644
+--- a/web/lib/types.ts
++++ b/web/lib/types.ts
+@@ -7,7 +7,8 @@ export type View =
+   | "deepdive"
+   | "map"
+   | "suppliers"
+-  | "shortlist";
++  | "shortlist"
++  | "ideas";
+ export type Go = (view: View, id?: string | null) => void;
+ 
+ export type InsightAction = "PROCURE" | "WATCH" | "HOLD";
+-- 
+2.43.0
+
